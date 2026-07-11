@@ -6,7 +6,7 @@
 .DESCRIPTION
     Tests the following functionality:
     1. Health endpoint returns 200
-    2. NHI access endpoint grants temporary access
+    2. NHI access endpoint starts a Durable grant lifecycle and reaches active state
     3. Role assignment is created on target resource
     4. (Optional) Wait for expiry and verify revocation
 
@@ -19,6 +19,9 @@
 .PARAMETER KeyVaultResourceId
     Resource ID of the Key Vault for testing access grants.
 
+.PARAMETER FunctionKey
+    Function key for authenticating requests.
+
 .PARAMETER WaitForRevocation
     Wait for access to expire and verify revocation (adds delay).
 
@@ -27,9 +30,9 @@
 
 .EXAMPLE
     ./Test-Lab.ps1 -FunctionAppUrl "https://zsp-lab-gw-abc123.azurewebsites.net" `
+                   -FunctionKey "your-function-key" `
                    -BackupSpObjectId "abc123" `
-                   -KeyVaultResourceId "/subscriptions/.../Microsoft.KeyVault/vaults/..." `
-                   -FunctionKey "your-function-key"
+                   -KeyVaultResourceId "/subscriptions/.../Microsoft.KeyVault/vaults/..."
 #>
 
 [CmdletBinding()]
@@ -38,13 +41,13 @@ param(
     [string]$FunctionAppUrl,
 
     [Parameter(Mandatory)]
+    [string]$FunctionKey,
+
+    [Parameter(Mandatory)]
     [string]$BackupSpObjectId,
 
     [Parameter(Mandatory)]
     [string]$KeyVaultResourceId,
-
-    [Parameter(Mandatory)]
-    [string]$FunctionKey,
 
     [Parameter()]
     [switch]$WaitForRevocation,
@@ -59,13 +62,13 @@ Write-Host "`n=== ZSP Lab Smoke Tests ===" -ForegroundColor Cyan
 
 $passed = 0
 $failed = 0
+$functionHeaders = @{ 'x-functions-key' = $FunctionKey }
 
 # Test 1: Health endpoint
 Write-Host "`nTest 1: Health endpoint" -ForegroundColor Yellow
 try {
     $healthUrl = "$FunctionAppUrl/api/health"
-    $headers = @{ "x-functions-key" = $FunctionKey }
-    $healthResponse = Invoke-RestMethod -Uri $healthUrl -Method GET -Headers $headers -TimeoutSec 30
+    $healthResponse = Invoke-RestMethod -Uri $healthUrl -Method GET -Headers $functionHeaders -TimeoutSec 30
 
     if ($healthResponse.status -eq 'healthy') {
         Write-Host "  PASSED: Health check returned healthy" -ForegroundColor Green
@@ -86,28 +89,48 @@ Write-Host "`nTest 2: NHI Access grant" -ForegroundColor Yellow
 $assignmentId = $null
 try {
     $nhiUrl = "$FunctionAppUrl/api/nhi-access"
-    $headers = @{ "x-functions-key" = $FunctionKey }
     $body = @{
         sp_object_id = $BackupSpObjectId
         scope = $KeyVaultResourceId
         role = "Key Vault Secrets User"
         duration_minutes = $TestDurationMinutes
-        workflow_id = "smoke-test-$(Get-Date -Format 'yyyyMMddHHmmss')"
+        workflow_id = "manual-test"
     } | ConvertTo-Json
 
-    $nhiResponse = Invoke-RestMethod -Uri $nhiUrl -Method POST -Body $body -ContentType "application/json" -Headers $headers -TimeoutSec 60
+    $nhiResponse = Invoke-RestMethod -Uri $nhiUrl -Method POST -Headers $functionHeaders -Body $body -ContentType "application/json" -TimeoutSec 60
 
-    if ($nhiResponse.status -eq 'granted') {
-        Write-Host "  PASSED: Access granted" -ForegroundColor Green
-        Write-Host "    Assignment ID: $($nhiResponse.assignment_id)" -ForegroundColor Gray
-        Write-Host "    Expires at: $($nhiResponse.expires_at)" -ForegroundColor Gray
-        $assignmentId = $nhiResponse.assignment_id
-        $passed++
+    if (-not $nhiResponse.statusQueryGetUri) {
+        throw "Durable management response did not include statusQueryGetUri"
     }
-    else {
-        Write-Host "  FAILED: Unexpected status: $($nhiResponse.status)" -ForegroundColor Red
-        $failed++
+
+    $deadline = (Get-Date).AddSeconds(90)
+    $lifecycleStatus = $null
+    do {
+        Start-Sleep -Seconds 2
+        $lifecycleStatus = Invoke-RestMethod -Uri $nhiResponse.statusQueryGetUri -Method GET -TimeoutSec 30
+        if ($lifecycleStatus.runtimeStatus -in @('Failed', 'Terminated', 'Canceled')) {
+            throw "Lifecycle entered $($lifecycleStatus.runtimeStatus): $($lifecycleStatus.output | ConvertTo-Json -Compress)"
+        }
+    } until (
+        $lifecycleStatus.customStatus.status -eq 'active' -or
+        (Get-Date) -ge $deadline
+    )
+
+    if ($lifecycleStatus.customStatus.status -ne 'active') {
+        throw "Lifecycle did not reach active state before timeout (runtime=$($lifecycleStatus.runtimeStatus))"
     }
+
+    $grant = @($lifecycleStatus.customStatus.grants)[0]
+    if (-not $grant.assignment_id) {
+        throw "Active lifecycle did not expose its deterministic assignment ID"
+    }
+
+    Write-Host "  PASSED: Durable lifecycle is active" -ForegroundColor Green
+    Write-Host "    Instance ID: $($nhiResponse.id)" -ForegroundColor Gray
+    Write-Host "    Assignment ID: $($grant.assignment_id)" -ForegroundColor Gray
+    Write-Host "    Expires at: $($lifecycleStatus.customStatus.expires_at)" -ForegroundColor Gray
+    $assignmentId = $grant.assignment_id
+    $passed++
 }
 catch {
     Write-Host "  FAILED: NHI access error: $($_.Exception.Message)" -ForegroundColor Red

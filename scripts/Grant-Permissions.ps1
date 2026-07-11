@@ -47,6 +47,29 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Helper: Write JSON to temp file for cross-platform az rest compatibility
+# Avoids PS 7.0-7.2 Windows bug where double quotes are stripped from native command args
+$script:_jsonTempFiles = @()
+function New-JsonBodyFile {
+    param([Parameter(Mandatory)][string]$Json)
+    $f = (New-TemporaryFile).FullName
+    [System.IO.File]::WriteAllText($f, $Json, [System.Text.Encoding]::UTF8)
+    $script:_jsonTempFiles += $f
+    return "@$f"
+}
+
+function Assert-AzCommandSucceeded {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "Azure CLI failed to $Operation (exit code $exitCode)."
+    }
+}
+
 # Well-known IDs
 $MsGraphAppId = '00000003-0000-0000-c000-000000000000'
 $GroupMemberReadWriteAllId = '62a82d76-70ea-41e2-9197-370581804d09'
@@ -89,8 +112,9 @@ else {
             az rest --method POST `
                 --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$FunctionAppPrincipalId/appRoleAssignments" `
                 --headers "Content-Type=application/json" `
-                --body $body `
+                --body (New-JsonBodyFile $body) `
                 --output none 2>$null
+            Assert-AzCommandSucceeded -Operation 'grant GroupMember.ReadWrite.All'
             Write-Host "    Granted" -ForegroundColor Green
             break
         }
@@ -123,8 +147,9 @@ else {
             az rest --method POST `
                 --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$FunctionAppPrincipalId/appRoleAssignments" `
                 --headers "Content-Type=application/json" `
-                --body $body `
+                --body (New-JsonBodyFile $body) `
                 --output none 2>$null
+            Assert-AzCommandSucceeded -Operation 'grant Directory.Read.All'
             Write-Host "    Granted" -ForegroundColor Green
             break
         }
@@ -157,8 +182,9 @@ else {
             az rest --method POST `
                 --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$FunctionAppPrincipalId/appRoleAssignments" `
                 --headers "Content-Type=application/json" `
-                --body $body `
+                --body (New-JsonBodyFile $body) `
                 --output none 2>$null
+            Assert-AzCommandSucceeded -Operation 'grant RoleManagement.ReadWrite.Directory'
             Write-Host "    Granted" -ForegroundColor Green
             break
         }
@@ -192,6 +218,7 @@ else {
                 --role "User Access Administrator" `
                 --scope $ResourceGroupId `
                 --output none 2>$null
+            Assert-AzCommandSucceeded -Operation 'grant User Access Administrator'
             Write-Host "    Granted" -ForegroundColor Green
             break
         }
@@ -226,6 +253,7 @@ if ($DcrScope) {
                     --role "Monitoring Metrics Publisher" `
                     --scope $DcrScope `
                     --output none 2>$null
+                Assert-AzCommandSucceeded -Operation 'grant Monitoring Metrics Publisher'
                 Write-Host "    Granted" -ForegroundColor Green
                 break
             }
@@ -239,6 +267,9 @@ if ($DcrScope) {
         }
     }
 }
+
+# Cleanup temp files
+$script:_jsonTempFiles | ForEach-Object { Remove-Item $_ -Force -ErrorAction SilentlyContinue }
 
 Write-Host "Permissions granted successfully" -ForegroundColor Green
 exit 0

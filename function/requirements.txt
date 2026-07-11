@@ -1,18 +1,20 @@
 # Azure Functions
-azure-functions>=1.17.0
-azure-functions-durable>=1.2.0
+# The Function App is deployed on Python 3.11. azure-functions 2.x requires
+# Python 3.13+, so keep this runtime-compatible upper bound explicit.
+azure-functions>=1.24.0,<2.0.0
+azure-functions-durable>=1.6.0
 
 # Azure Identity (for managed identity)
-azure-identity>=1.15.0
+azure-identity>=1.25.3
 
 # Microsoft Graph SDK
-msgraph-sdk>=1.2.0
+msgraph-sdk>=1.58.0
 
 # Azure Management
 azure-mgmt-authorization>=4.0.0
 
 # Azure Monitor (for Log Analytics ingestion)
-azure-monitor-ingestion>=1.0.3
+azure-monitor-ingestion>=1.1.0
 
 # Utilities
 python-dateutil>=2.8.2

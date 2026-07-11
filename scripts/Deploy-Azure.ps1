@@ -64,7 +64,6 @@ Write-Host "Deploying Azure resources..." -ForegroundColor Yellow
 # Deploy at subscription scope
 $deploymentName = "zsp-lab-$(Get-Date -Format 'yyyyMMddHHmmss')"
 
-$stderrFile = [System.IO.Path]::GetTempFileName()
 $deployment = az deployment sub create `
     --name $deploymentName `
     --location $Location `
@@ -73,15 +72,12 @@ $deployment = az deployment sub create `
     --parameters location=$Location `
     --parameters maxAccessDurationMinutes=$MaxAccessDurationMinutes `
     --parameters deployerPrincipalId=$DeployerPrincipalId `
-    --output json 2>$stderrFile
+    --output json 2>$null
 
 if ($LASTEXITCODE -ne 0) {
-    $stderrContent = Get-Content $stderrFile -Raw -ErrorAction SilentlyContinue
-    Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
-    Write-Error "Bicep deployment failed: $stderrContent"
+    Write-Error "Bicep deployment failed"
     exit 1
 }
-Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
 
 $result = $deployment | ConvertFrom-Json
 

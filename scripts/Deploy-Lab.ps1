@@ -28,6 +28,19 @@
 .PARAMETER SkipTest
     Skip running the smoke test after deployment
 
+.PARAMETER ExpectedIntuneAdminGroupId
+    Existing Intune Admins group object ID from the original deployment. For a
+    rerun, provide this together with all other Expected*ObjectId parameters.
+
+.PARAMETER ExpectedSecurityReaderGroupId
+    Existing Security Reader group object ID from the original deployment.
+
+.PARAMETER ExpectedBackupAppObjectId
+    Existing backup application registration object ID (not its client ID).
+
+.PARAMETER ExpectedBackupSpObjectId
+    Existing backup service principal object ID.
+
 .EXAMPLE
     ./Deploy-Lab.ps1
     Deploys with default settings (zsp-lab in eastus)
@@ -35,6 +48,14 @@
 .EXAMPLE
     ./Deploy-Lab.ps1 -ProjectName "my-zsp" -Location "westus2"
     Deploys with custom project name and region
+
+.EXAMPLE
+    ./Deploy-Lab.ps1 -ProjectName "my-zsp" `
+      -ExpectedIntuneAdminGroupId "<OBJECT_ID>" `
+      -ExpectedSecurityReaderGroupId "<OBJECT_ID>" `
+      -ExpectedBackupAppObjectId "<OBJECT_ID>" `
+      -ExpectedBackupSpObjectId "<OBJECT_ID>"
+    Safely reruns against the exact Entra objects from the original deployment.
 #>
 
 [CmdletBinding()]
@@ -55,11 +76,38 @@ param(
     [switch]$SkipFunctionDeploy,
 
     [Parameter()]
-    [switch]$SkipTest
+    [switch]$SkipTest,
+
+    [Parameter()]
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string]$ExpectedIntuneAdminGroupId,
+
+    [Parameter()]
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string]$ExpectedSecurityReaderGroupId,
+
+    [Parameter()]
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string]$ExpectedBackupAppObjectId,
+
+    [Parameter()]
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string]$ExpectedBackupSpObjectId
 )
 
 $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Helper: Write JSON to temp file for cross-platform az rest compatibility
+# Avoids PS 7.0-7.2 Windows bug where double quotes are stripped from native command args
+$script:_jsonTempFiles = @()
+function New-JsonBodyFile {
+    param([Parameter(Mandatory)][string]$Json)
+    $f = (New-TemporaryFile).FullName
+    [System.IO.File]::WriteAllText($f, $Json, [System.Text.Encoding]::UTF8)
+    $script:_jsonTempFiles += $f
+    return "@$f"
+}
 $LabRoot = Split-Path -Parent $ScriptDir
 
 Write-Host "`n=== Zero Standing Privilege Lab Deployment ===" -ForegroundColor Cyan
@@ -115,13 +163,38 @@ foreach ($line in $outputs) {
     }
 }
 
+# Validate critical deployment outputs
+$requiredKeys = @(
+    'RESOURCE_GROUP_NAME', 'RESOURCE_GROUP_ID', 'FUNCTION_APP_NAME',
+    'FUNCTION_APP_PRINCIPAL_ID', 'LOG_ANALYTICS_WORKSPACE_ID',
+    'SUBSCRIPTION_ID', 'DCR_ENDPOINT_URL'
+)
+foreach ($key in $requiredKeys) {
+    if (-not $config[$key]) {
+        throw "Missing required deployment output: $key. Check Deploy-Azure.ps1 completed successfully."
+    }
+}
+
 Write-Host "  Resource Group: $($config['RESOURCE_GROUP_NAME'])" -ForegroundColor Green
 Write-Host "  Function App: $($config['FUNCTION_APP_NAME'])" -ForegroundColor Green
 Write-Host ""
 
 # Step 2: Create Entra ID Objects
 Write-Host "Step 2/7: Creating Entra ID objects..." -ForegroundColor Cyan
-$entraOutput = & "$ScriptDir/Setup-EntraID.ps1" -ProjectName $ProjectName
+$entraParameters = @{ ProjectName = $ProjectName }
+if (-not [string]::IsNullOrWhiteSpace($ExpectedIntuneAdminGroupId)) {
+    $entraParameters['ExpectedIntuneAdminGroupId'] = $ExpectedIntuneAdminGroupId
+}
+if (-not [string]::IsNullOrWhiteSpace($ExpectedSecurityReaderGroupId)) {
+    $entraParameters['ExpectedSecurityReaderGroupId'] = $ExpectedSecurityReaderGroupId
+}
+if (-not [string]::IsNullOrWhiteSpace($ExpectedBackupAppObjectId)) {
+    $entraParameters['ExpectedBackupAppObjectId'] = $ExpectedBackupAppObjectId
+}
+if (-not [string]::IsNullOrWhiteSpace($ExpectedBackupSpObjectId)) {
+    $entraParameters['ExpectedBackupSpObjectId'] = $ExpectedBackupSpObjectId
+}
+$entraOutput = & "$ScriptDir/Setup-EntraID.ps1" @entraParameters
 
 if ($LASTEXITCODE -ne 0) {
     throw "Entra ID setup failed"
@@ -137,8 +210,19 @@ foreach ($line in $entraOutput) {
     }
 }
 
+$requiredEntraKeys = @(
+    'ENTRA_TENANT_ID', 'INTUNE_ADMIN_GROUP_ID', 'SECURITY_READER_GROUP_ID',
+    'BACKUP_APP_OBJECT_ID', 'BACKUP_SP_OBJECT_ID', 'BACKUP_SP_CLIENT_ID'
+)
+foreach ($key in $requiredEntraKeys) {
+    if (-not $config[$key]) {
+        throw "Missing required Entra setup output: $key. No downstream permissions will be configured."
+    }
+}
+
 Write-Host "  Intune Admin Group: $($config['INTUNE_ADMIN_GROUP_ID'])" -ForegroundColor Green
 Write-Host "  Security Reader Group: $($config['SECURITY_READER_GROUP_ID'])" -ForegroundColor Green
+Write-Host "  Backup App Object: $($config['BACKUP_APP_OBJECT_ID'])" -ForegroundColor Green
 Write-Host "  Backup SP: $($config['BACKUP_SP_OBJECT_ID'])" -ForegroundColor Green
 Write-Host ""
 
@@ -181,8 +265,12 @@ $tableBody = @{
 az rest --method PUT `
     --uri "https://management.azure.com${workspaceId}/tables/ZSPAudit_CL?api-version=2022-10-01" `
     --headers "Content-Type=application/json" `
-    --body $tableBody `
-    --output none 2>$null
+    --body (New-JsonBodyFile $tableBody) `
+    --output none
+
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to create ZSPAudit_CL custom table. Check deployer has Log Analytics Contributor on the workspace."
+}
 
 Write-Host "    ZSPAudit_CL table created" -ForegroundColor Green
 
@@ -233,13 +321,21 @@ $dcrBody = @{
     }
 } | ConvertTo-Json -Depth 10 -Compress
 
-$dcrResult = az rest --method PUT `
+$dcrJson = az rest --method PUT `
     --uri "https://management.azure.com/subscriptions/$($config['SUBSCRIPTION_ID'])/resourceGroups/$rgName/providers/Microsoft.Insights/dataCollectionRules/$ProjectName-dcr?api-version=2022-06-01" `
     --headers "Content-Type=application/json" `
-    --body $dcrBody `
-    --output json 2>$null | ConvertFrom-Json
+    --body (New-JsonBodyFile $dcrBody) `
+    --output json
 
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to create Data Collection Rule. Check deployer has Monitoring Contributor on the resource group."
+}
+
+$dcrResult = $dcrJson | ConvertFrom-Json
 $dcrRuleId = $dcrResult.properties.immutableId
+if (-not $dcrRuleId) {
+    throw "DCR created but immutableId not found in response. Check the DCR resource in the portal."
+}
 $config['DCR_RULE_ID'] = $dcrRuleId
 Write-Host "    DCR created with immutableId: $dcrRuleId" -ForegroundColor Green
 Write-Host ""
@@ -265,6 +361,7 @@ Write-Host "Step 5/7: Configuring Function App..." -ForegroundColor Cyan
     -IntuneAdminGroupId $config['INTUNE_ADMIN_GROUP_ID'] `
     -SecurityReaderGroupId $config['SECURITY_READER_GROUP_ID'] `
     -BackupSpObjectId $config['BACKUP_SP_OBJECT_ID'] `
+    -AllowedAdminUserIds $deployerPrincipalId `
     -KeyVaultResourceId $config['KEYVAULT_ID'] `
     -StorageResourceId $config['STORAGE_ACCOUNT_ID'] `
     -LogAnalyticsWorkspaceId $config['LOG_ANALYTICS_WORKSPACE_CUSTOMER_ID'] `
@@ -298,7 +395,8 @@ if (-not $SkipFunctionDeploy) {
         # Fallback to zip deploy if func CLI not available
         Write-Host "  func CLI not available, using zip deploy..." -ForegroundColor Yellow
 
-        $zipPath = Join-Path $env:TEMP "function-deploy.zip"
+        $tempDir = if ($env:TEMP) { $env:TEMP } elseif ($env:TMPDIR) { $env:TMPDIR } else { '/tmp' }
+        $zipPath = Join-Path $tempDir "function-deploy.zip"
         Compress-Archive -Path "$functionDir/*" -DestinationPath $zipPath -Force
 
         az functionapp deployment source config-zip `
@@ -324,34 +422,26 @@ Write-Host ""
 if (-not $SkipTest) {
     Write-Host "Step 7/7: Running smoke test..." -ForegroundColor Cyan
 
-    # Retrieve function key for authentication
-    Write-Host "  Retrieving function key..." -ForegroundColor Cyan
+    # Retrieve the function key for authenticated requests
     $functionKey = az functionapp keys list `
         --name $config['FUNCTION_APP_NAME'] `
         --resource-group $config['RESOURCE_GROUP_NAME'] `
-        --query "functionKeys.default" `
-        --output tsv 2>$null
+        --query "functionKeys.default" -o tsv 2>$null
 
     if (-not $functionKey) {
-        # Fallback to master key
-        $functionKey = az functionapp keys list `
-            --name $config['FUNCTION_APP_NAME'] `
-            --resource-group $config['RESOURCE_GROUP_NAME'] `
-            --query "masterKey" `
-            --output tsv 2>$null
+        Write-Host "  WARNING: Could not retrieve function key, skipping smoke test" -ForegroundColor Yellow
     }
-
-    if (-not $functionKey) {
-        Write-Host "  WARNING: Could not retrieve function key, smoke tests may fail with 401" -ForegroundColor Yellow
-        $functionKey = ""
+    else {
+        & "$ScriptDir/Test-Lab.ps1" `
+            -FunctionAppUrl $config['FUNCTION_APP_URL'] `
+            -FunctionKey $functionKey `
+            -BackupSpObjectId $config['BACKUP_SP_OBJECT_ID'] `
+            -KeyVaultResourceId $config['KEYVAULT_ID']
     }
-
-    & "$ScriptDir/Test-Lab.ps1" `
-        -FunctionAppUrl $config['FUNCTION_APP_URL'] `
-        -BackupSpObjectId $config['BACKUP_SP_OBJECT_ID'] `
-        -KeyVaultResourceId $config['KEYVAULT_ID'] `
-        -FunctionKey $functionKey
 }
+
+# Cleanup temp files
+$script:_jsonTempFiles | ForEach-Object { Remove-Item $_ -Force -ErrorAction SilentlyContinue }
 
 # Summary
 Write-Host "`n=== Deployment Complete ===" -ForegroundColor Green
@@ -369,13 +459,15 @@ Write-Host "  Security Reader: $($config['SECURITY_READER_GROUP_ID'])"
 Write-Host ""
 Write-Host "Backup Service Principal: $($config['BACKUP_SP_OBJECT_ID'])"
 Write-Host ""
-Write-Host "Function Key: $functionKey" -ForegroundColor Cyan
+Write-Host "Safe rerun (immutable Entra IDs are mandatory once these names exist):"
+$safeRerunCommand = "./scripts/Deploy-Lab.ps1 -ProjectName `"$ProjectName`" -ExpectedIntuneAdminGroupId `"$($config['INTUNE_ADMIN_GROUP_ID'])`" -ExpectedSecurityReaderGroupId `"$($config['SECURITY_READER_GROUP_ID'])`" -ExpectedBackupAppObjectId `"$($config['BACKUP_APP_OBJECT_ID'])`" -ExpectedBackupSpObjectId `"$($config['BACKUP_SP_OBJECT_ID'])`""
+Write-Host $safeRerunCommand -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Test NHI access with:"
 Write-Host @"
 curl -X POST "$($config['FUNCTION_APP_URL'])/api/nhi-access" \
   -H "Content-Type: application/json" \
-  -H "x-functions-key: $functionKey" \
+  -H "x-functions-key: <FUNCTION_KEY>" \
   -d '{
     "sp_object_id": "$($config['BACKUP_SP_OBJECT_ID'])",
     "scope": "$($config['KEYVAULT_ID'])",
@@ -384,3 +476,5 @@ curl -X POST "$($config['FUNCTION_APP_URL'])/api/nhi-access" \
     "workflow_id": "manual-test"
   }'
 "@ -ForegroundColor DarkGray
+Write-Host "The POST returns a Durable Functions management payload (HTTP 202)." -ForegroundColor Yellow
+Write-Host "Poll its statusQueryGetUri until customStatus.status is 'active' before using the access." -ForegroundColor Yellow

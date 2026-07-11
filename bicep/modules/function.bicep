@@ -15,8 +15,8 @@ param logAnalyticsWorkspaceId string
 @description('Tags for all resources')
 param tags object = {}
 
-// Generate unique suffix for globally unique resource names
-var suffix = substring(uniqueString(resourceGroup().id), 0, 6)
+// Generate unique suffix to ensure globally unique resource names
+var uniqueSuffix = uniqueString(resourceGroup().id)
 
 // Merge default tags
 var resourceTags = union({
@@ -27,7 +27,7 @@ var resourceTags = union({
 
 // Storage account for Function App (Flex Consumption requires blob containers)
 resource functionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
-  name: '${replace(projectName, '-', '')}fn${suffix}'
+  name: take('${replace(projectName, '-', '')}fn${uniqueSuffix}', 24)
   location: location
   tags: resourceTags
   sku: {
@@ -85,7 +85,7 @@ resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
 
 // Function App with Flex Consumption
 resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
-  name: '${projectName}-gw-${suffix}'
+  name: '${projectName}-gw-${uniqueSuffix}'
   location: location
   tags: resourceTags
   kind: 'functionapp,linux'
