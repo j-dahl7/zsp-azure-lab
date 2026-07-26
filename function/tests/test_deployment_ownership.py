@@ -39,7 +39,7 @@ ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def plain_process_output(result: subprocess.CompletedProcess) -> str:
     """Remove terminal styling and renderer-inserted line wrapping."""
     unstyled = ANSI_CONTROL_SEQUENCE.sub("", result.stderr + result.stdout)
-    return " ".join(unstyled.split())
+    return " ".join(token for token in unstyled.split() if token != "|")
 
 
 class ZspStaticSafetyTests(unittest.TestCase):
@@ -48,7 +48,7 @@ class ZspStaticSafetyTests(unittest.TestCase):
             args=["pwsh"],
             returncode=1,
             stdout="",
-            stderr="\x1b[31mRefusing to\n adopt it.\x1b[0m",
+            stderr="\x1b[31mRefusing to\n | adopt it.\x1b[0m",
         )
         self.assertIn("Refusing to adopt it.", plain_process_output(result))
 
