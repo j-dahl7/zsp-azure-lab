@@ -33,6 +33,12 @@ PROJECT = "zsp-lab"
 RESOURCE_GROUP = f"{PROJECT}-rg"
 RESOURCE_GROUP_ID = f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}"
 OWNER_MARKER = "nine-lives-zsp:azure:v1"
+ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def plain_process_output(result: subprocess.CompletedProcess) -> str:
+    """Remove terminal styling without changing the message under test."""
+    return ANSI_CONTROL_SEQUENCE.sub("", result.stderr + result.stdout)
 
 
 class ZspStaticSafetyTests(unittest.TestCase):
@@ -378,7 +384,7 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
         self._write_state(rg_exists=True, owner="foreign", deployment="foreign")
         result = self._deploy_azure()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Refusing to adopt", result.stderr + result.stdout)
+        self.assertIn("Refusing to adopt", plain_process_output(result))
         self.assertFalse(self.manifest_path.exists())
         self.assertFalse(any(call[:3] == ["deployment", "sub", "create"] for call in self._calls()))
 
@@ -447,7 +453,7 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
             "-Confirm:$false",
         )
         self.assertNotEqual(collision.returncode, 0)
-        self.assertIn("No resources were deleted", collision.stderr + collision.stdout)
+        self.assertIn("No resources were deleted", plain_process_output(collision))
         self.assertFalse(
             any(call[:2] == ["group", "delete"] for call in self._calls()[calls_before_collision:])
         )
