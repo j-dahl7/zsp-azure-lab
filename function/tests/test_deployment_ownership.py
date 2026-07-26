@@ -37,11 +37,21 @@ ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def plain_process_output(result: subprocess.CompletedProcess) -> str:
-    """Remove terminal styling without changing the message under test."""
-    return ANSI_CONTROL_SEQUENCE.sub("", result.stderr + result.stdout)
+    """Remove terminal styling and renderer-inserted line wrapping."""
+    unstyled = ANSI_CONTROL_SEQUENCE.sub("", result.stderr + result.stdout)
+    return " ".join(unstyled.split())
 
 
 class ZspStaticSafetyTests(unittest.TestCase):
+    def test_powershell_error_normalizer_preserves_wrapped_message(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["pwsh"],
+            returncode=1,
+            stdout="",
+            stderr="\x1b[31mRefusing to\n adopt it.\x1b[0m",
+        )
+        self.assertIn("Refusing to adopt it.", plain_process_output(result))
+
     def test_bicep_has_non_overridable_ownership_tags(self) -> None:
         source = BICEP.read_text(encoding="utf-8")
         self.assertIn("param ownerMarker string", source)
