@@ -144,3 +144,45 @@ ZSPAudit_CL
 | project TimeGenerated, PrincipalId, Target, Justification
 | order by TimeGenerated desc
 """
+
+
+def build_kql_query_unrevoked_expired_grants(grace_minutes: int = 15) -> str:
+    """Return KQL for grants that are past expiry with no successful revoke.
+
+    This is the hunt for standing privilege. A lifecycle that refuses to revoke
+    a membership it cannot prove it owns fails closed against deleting someone
+    else's entitlement, but the granted access can remain live. Those cases
+    surface here as an expired grant with no matching successful AccessRevoke.
+
+    The grace window absorbs the normal gap between the expiry timer firing and
+    the revoke activity completing, so a healthy lifecycle does not alert.
+    """
+    if not isinstance(grace_minutes, int) or isinstance(grace_minutes, bool) or grace_minutes < 1:
+        raise ValueError("grace_minutes must be a positive integer")
+
+    return f"""
+let grace = {grace_minutes}m;
+let grants =
+    ZSPAudit_CL
+    | where EventType == "AccessGrant" and Result == "Success"
+    | where isnotempty(ExpiresAt)
+    | extend Expiry = todatetime(ExpiresAt)
+    | project GrantTime = TimeGenerated, PrincipalId, Target, Role, IdentityType, Expiry;
+let revokes =
+    ZSPAudit_CL
+    | where EventType == "AccessRevoke" and Result == "Success"
+    | project RevokeTime = TimeGenerated, PrincipalId, Target;
+grants
+| where Expiry < ago(grace)
+| join kind=leftouter revokes on PrincipalId, Target
+| where isnull(RevokeTime) or RevokeTime < GrantTime
+| summarize
+    Grants = count(),
+    LastGrant = max(GrantTime),
+    LastExpiry = max(Expiry)
+  by PrincipalId, Target, Role, IdentityType
+| extend
+    MinutesOverdue = datetime_diff('minute', now(), LastExpiry),
+    Finding = "Expired grant with no successful revoke"
+| order by MinutesOverdue desc
+"""
