@@ -183,21 +183,25 @@ before reuse. Older unmarked objects are not auto-adopted.
 ### Immutable Function Dependencies
 
 Azure Functions remote build reads `function/requirements.txt`, which enables
-pip hash-checking and includes `function/requirements.lock`. The lock pins all
-55 resolved Python 3.11 packages and their distribution hashes. CI installs
-that lock with `--require-hashes` before tests. Edit direct requirements only in
-`function/requirements.in`, then regenerate the lock with:
+pip hash-checking and includes `function/pins.txt`. The pins file locks all 55
+resolved Python 3.11 packages and their distribution hashes. CI installs the
+same manifest with `--require-hashes` before tests. Edit direct requirements
+only in `function/requirements.in`, then regenerate the pins with:
 
 ```bash
 uv pip compile --python-version 3.11 --universal --generate-hashes \
-  function/requirements.in -o function/requirements.lock
+  function/requirements.in -o function/pins.txt
 ```
+
+The `.txt` extension lets Dependabot follow the nested pins file, while
+`function/.python-version` keeps its resolver on the same Python 3.11 line as
+Azure Functions and CI.
 
 Function publishing excludes `local.settings.json`, virtual environments,
 tests, caches, private-key files, and arbitrary working-directory content.
 Core Tools follows `function/.funcignore`; the zip fallback builds an explicit
 allowlist containing only reviewed runtime modules, `host.json`, and the two
-hash-lock files.
+dependency manifest files.
 
 ### 3. Test NHI Access
 
@@ -279,8 +283,9 @@ zsp-azure-lab/
 │   ├── nhi_access.py         # NHI ZSP logic
 │   ├── admin_access.py       # Human ZSP logic
 │   ├── audit.py              # Logging utilities
+│   ├── .python-version       # Dependabot/pyenv Python 3.11 selection
 │   ├── requirements.in       # Direct dependency constraints
-│   ├── requirements.lock     # Python 3.11 transitive pins + hashes
+│   ├── pins.txt              # Python 3.11 transitive pins + hashes
 │   ├── requirements.txt      # Remote-build hash-lock entry point
 │   └── host.json
 └── .github/workflows/

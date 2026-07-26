@@ -1,4 +1,4 @@
 # Azure Functions remote-build entry point.
-# The nested lock and explicit mode make every deployment hash-verified.
+# Dependabot follows the nested .txt file while pip enforces every hash.
 --require-hashes
--r requirements.lock
+-r pins.txt
