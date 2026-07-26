@@ -1,4 +1,4 @@
-# Direct Azure Functions dependencies. Regenerate requirements.lock for Python 3.11.
+# Direct Azure Functions dependencies. Regenerate pins.txt for Python 3.11.
 azure-functions>=1.24.0,<2.0.0
 azure-functions-durable>=1.6.0
 azure-identity>=1.25.3

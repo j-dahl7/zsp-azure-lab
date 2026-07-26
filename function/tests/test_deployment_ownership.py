@@ -22,7 +22,8 @@ CLEANUP = LAB_ROOT / "scripts" / "Cleanup-Lab.ps1"
 TEST_LAB = LAB_ROOT / "scripts" / "Test-Lab.ps1"
 BICEP = LAB_ROOT / "bicep" / "main.bicep"
 REQUIREMENTS = LAB_ROOT / "function" / "requirements.txt"
-LOCK = LAB_ROOT / "function" / "requirements.lock"
+PINS = LAB_ROOT / "function" / "pins.txt"
+PYTHON_VERSION = LAB_ROOT / "function" / ".python-version"
 FUNCIGNORE = LAB_ROOT / "function" / ".funcignore"
 WORKFLOW = LAB_ROOT / ".github" / "workflows" / "validate.yml"
 
@@ -107,8 +108,9 @@ class ZspStaticSafetyTests(unittest.TestCase):
     def test_function_remote_build_and_ci_enforce_hash_lock(self) -> None:
         entrypoint = REQUIREMENTS.read_text(encoding="utf-8").splitlines()
         self.assertIn("--require-hashes", entrypoint)
-        self.assertIn("-r requirements.lock", entrypoint)
-        lock = LOCK.read_text(encoding="utf-8")
+        self.assertIn("-r pins.txt", entrypoint)
+        self.assertEqual(PYTHON_VERSION.read_text(encoding="utf-8").strip(), "3.11")
+        lock = PINS.read_text(encoding="utf-8")
         for package in (
             "azure-functions==",
             "azure-functions-durable==",
@@ -141,7 +143,7 @@ class ZspStaticSafetyTests(unittest.TestCase):
             "nhi_access.py",
             "host.json",
             "requirements.txt",
-            "requirements.lock",
+            "pins.txt",
         ):
             self.assertIn(f"'{runtime_file}'", deploy)
 

@@ -528,7 +528,7 @@ if (-not $SkipFunctionDeploy) {
             $deploymentFiles = @(
                 'access_safety.py', 'admin_access.py', 'audit.py',
                 'function_app.py', 'nhi_access.py', 'host.json',
-                'requirements.txt', 'requirements.lock'
+                'requirements.txt', 'pins.txt'
             )
             try {
                 $null = New-Item -ItemType Directory -Path $packageRoot
