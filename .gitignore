@@ -30,3 +30,5 @@ Thumbs.db
 *.pem
 *.key
 credentials.json
+.zsp-deployment.json
+.zsp-deployment.json.tmp.*

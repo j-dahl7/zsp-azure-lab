@@ -26,6 +26,9 @@
 .PARAMETER BackupSpObjectId
     Object ID of the backup service principal.
 
+.PARAMETER AllowedAdminUserIds
+    Comma-separated Entra user object IDs allowed to request human admin access.
+
 .PARAMETER KeyVaultResourceId
     Resource ID of the Key Vault.
 
@@ -69,6 +72,9 @@ param(
     [string]$BackupSpObjectId,
 
     [Parameter(Mandatory)]
+    [string]$AllowedAdminUserIds,
+
+    [Parameter(Mandatory)]
     [string]$KeyVaultResourceId,
 
     [Parameter(Mandatory)]
@@ -101,6 +107,8 @@ Write-Host "Configuring Function App settings..." -ForegroundColor Yellow
 $settings = @(
     "INTUNE_ADMIN_GROUP_ID=$IntuneAdminGroupId"
     "SECURITY_READER_GROUP_ID=$SecurityReaderGroupId"
+    "ALLOWED_ADMIN_GROUP_IDS=$IntuneAdminGroupId,$SecurityReaderGroupId"
+    "ALLOWED_ADMIN_USER_IDS=$AllowedAdminUserIds"
     "BACKUP_SP_OBJECT_ID=$BackupSpObjectId"
     "KEYVAULT_RESOURCE_ID=$KeyVaultResourceId"
     "STORAGE_RESOURCE_ID=$StorageResourceId"

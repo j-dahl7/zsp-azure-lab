@@ -1,0 +1,11 @@
+.git*
+.vscode/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+tests/
+local.settings.json
+requirements.in
+*.pem
+*.key
