@@ -11,6 +11,10 @@ from azure.identity import DefaultAzureCredential
 from azure.monitor.ingestion import LogsIngestionClient
 
 
+class AuditWriteError(RuntimeError):
+    """The access event could not be written to ZSPAudit_CL."""
+
+
 async def log_access_event(
     event_type: str,
     identity_type: str,
@@ -89,8 +93,12 @@ async def log_access_event(
         logging.info(f"Audit log sent: {event_type} for {principal_id}")
 
     except Exception as e:
-        # Don't fail the operation if logging fails
+        # The custom table is the only record a grant leaves behind, so a
+        # transport failure has to reach the caller. Completing an access grant
+        # with nothing in ZSPAudit_CL is the failure this lab exists to prevent;
+        # the activity wrappers decide whether to retry or compensate.
         logging.error(f"Failed to send audit log: {e}")
+        raise AuditWriteError(f"Failed to send audit log: {e}") from e
 
 
 def build_kql_query_all_grants(hours: int = 24) -> str:

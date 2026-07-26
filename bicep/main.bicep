@@ -1,8 +1,9 @@
 // Zero Standing Privilege Lab - Main Orchestrator
 // Deploys all Azure infrastructure for ZSP Gateway
 //
-// Usage:
-//   az deployment sub create --location eastus --template-file main.bicep --parameters main.bicepparam
+// Deployment entry point: scripts/Deploy-Azure.ps1
+// Do not invoke this template directly. The wrapper performs the manifest and
+// live-tag ownership preflight that an ARM upsert cannot enforce by itself.
 //
 // Note: Entra ID objects (groups, service principals, permissions) are created
 // separately via PowerShell scripts due to Azure/Entra timing dependencies.
@@ -28,6 +29,23 @@ param deployerPrincipalId string
 @description('Additional tags for all resources')
 param tags object = {}
 
+@description('Stable lab owner marker recorded in the deployment manifest and Azure tags')
+@minLength(1)
+param ownerMarker string
+
+@description('Unique deployment identifier recorded in the deployment manifest and Azure tags')
+@minLength(36)
+@maxLength(36)
+param deploymentId string
+
+var ownershipTags = {
+  'nlzt-owner': ownerMarker
+  'nlzt-deployment': deploymentId
+}
+
+// Ownership tags are applied last so caller-provided tags cannot replace them.
+var effectiveTags = union(tags, ownershipTags)
+
 // Resource Group
 resource resourceGroup 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   name: '${projectName}-rg'
@@ -36,7 +54,7 @@ resource resourceGroup 'Microsoft.Resources/resourceGroups@2023-07-01' = {
     project: projectName
     environment: 'lab'
     purpose: 'zero-standing-privilege-demo'
-  }, tags)
+  }, effectiveTags)
 }
 
 // Monitoring Module - Deploy first as other modules depend on Log Analytics
@@ -46,7 +64,7 @@ module monitoring 'modules/monitoring.bicep' = {
   params: {
     projectName: projectName
     location: location
-    tags: tags
+    tags: effectiveTags
   }
 }
 
@@ -58,7 +76,7 @@ module core 'modules/core.bicep' = {
     projectName: projectName
     location: location
     deployerPrincipalId: deployerPrincipalId
-    tags: tags
+    tags: effectiveTags
   }
 }
 
@@ -70,7 +88,7 @@ module function 'modules/function.bicep' = {
     projectName: projectName
     location: location
     logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsWorkspaceId
-    tags: tags
+    tags: effectiveTags
   }
 }
 
@@ -89,7 +107,6 @@ output functionAppId string = function.outputs.functionAppId
 output functionAppName string = function.outputs.functionAppName
 output functionAppUrl string = function.outputs.functionAppUrl
 output functionAppPrincipalId string = function.outputs.functionAppPrincipalId
-output appInsightsConnectionString string = function.outputs.appInsightsConnectionString
 
 // Monitoring outputs
 output logAnalyticsWorkspaceId string = monitoring.outputs.logAnalyticsWorkspaceId

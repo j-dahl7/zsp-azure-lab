@@ -12,24 +12,29 @@ from azure.identity import DefaultAzureCredential
 from azure.mgmt.authorization import AuthorizationManagementClient
 from azure.mgmt.authorization.models import RoleAssignmentCreateParameters
 
+from access_safety import (
+    PreexistingEntitlementError,
+    exception_error_code,
+    is_explicit_not_found,
+)
+
 
 # Common role definition IDs (built-in roles)
 ROLE_DEFINITIONS = {
     "Key Vault Secrets User": "4633458b-17de-408a-b874-0445c86b69e6",
-    "Key Vault Secrets Officer": "b86a8fe4-44ce-4948-aee5-eccb2c155cd7",
     "Key Vault Reader": "21090545-7ca7-4776-b22c-e363652d74d2",
     "Storage Blob Data Reader": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
     "Storage Blob Data Contributor": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
     "Reader": "acdd72a7-3385-48ef-bd42-f606fba81ae7",
-    "Contributor": "b24988ac-6180-42a0-ab88-20f7382dd24c",
 }
 
 
 def get_subscription_id_from_scope(scope: str) -> str:
     """Extract subscription ID from a resource scope."""
     parts = scope.split("/")
-    if "subscriptions" in parts:
-        idx = parts.index("subscriptions")
+    normalized_parts = [part.casefold() for part in parts]
+    if "subscriptions" in normalized_parts:
+        idx = normalized_parts.index("subscriptions")
         return parts[idx + 1]
     raise ValueError(f"Could not extract subscription ID from scope: {scope}")
 
@@ -42,12 +47,79 @@ def get_role_definition_id(role_name: str, subscription_id: str) -> str:
     raise ValueError(f"Unknown role: {role_name}. Add it to ROLE_DEFINITIONS.")
 
 
+def _assignment_name(assignment) -> str:
+    name = getattr(assignment, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    assignment_id = getattr(assignment, "id", None)
+    if isinstance(assignment_id, str) and assignment_id:
+        return assignment_id.rstrip("/").rsplit("/", 1)[-1]
+    return ""
+
+
+def _matching_role_assignments(
+    auth_client,
+    *,
+    sp_object_id: str,
+    scope: str,
+    role_name: str,
+) -> list:
+    """Return exact principal/role/scope matches, failing closed on SDK errors."""
+
+    expected_role_guid = ROLE_DEFINITIONS[role_name].casefold()
+    existing_assignments = auth_client.role_assignments.list_for_scope(
+        scope=scope,
+        filter=f"principalId eq '{sp_object_id}'",
+    )
+    matches = []
+    for existing_assignment in existing_assignments:
+        existing_role_id = str(
+            getattr(existing_assignment, "role_definition_id", "") or ""
+        ).casefold()
+        existing_scope = getattr(existing_assignment, "scope", None)
+        if existing_scope and str(existing_scope).rstrip("/").casefold() != scope.rstrip("/").casefold():
+            continue
+        if existing_role_id.rstrip("/").endswith(f"/{expected_role_guid}"):
+            matches.append(existing_assignment)
+    return matches
+
+
+async def ensure_nhi_entitlement_absent(
+    sp_object_id: str,
+    scope: str,
+    role_name: str,
+    *,
+    auth_client=None,
+) -> None:
+    """Fail closed if the requested exact RBAC entitlement already exists."""
+
+    subscription_id = get_subscription_id_from_scope(scope)
+    if auth_client is None:
+        credential = DefaultAzureCredential()
+        auth_client = AuthorizationManagementClient(credential, subscription_id)
+
+    if _matching_role_assignments(
+        auth_client,
+        sp_object_id=sp_object_id,
+        scope=scope,
+        role_name=role_name,
+    ):
+        raise PreexistingEntitlementError(
+            f"Service principal {sp_object_id} already has {role_name} on {scope}"
+        )
+
+
 async def grant_nhi_access(
     sp_object_id: str,
     scope: str,
     role_name: str,
     duration_minutes: int,
-    workflow_id: str
+    workflow_id: str,
+    *,
+    auth_client=None,
+    assignment_name: str | None = None,
+    preflight_recorded: bool = False,
+    expires_at: str | None = None,
 ) -> dict:
     """
     Grant temporary role assignment to a service principal.
@@ -64,66 +136,120 @@ async def grant_nhi_access(
     """
     logging.info(f"Granting NHI access: sp={sp_object_id}, scope={scope}, role={role_name}, duration={duration_minutes}m")
 
-    credential = DefaultAzureCredential()
     subscription_id = get_subscription_id_from_scope(scope)
+    if auth_client is None:
+        credential = DefaultAzureCredential()
+        auth_client = AuthorizationManagementClient(credential, subscription_id)
 
-    auth_client = AuthorizationManagementClient(credential, subscription_id)
-
-    # Generate unique assignment name
-    assignment_name = str(uuid.uuid4())
+    # A Durable lifecycle passes a deterministic name so an at-least-once
+    # activity retry can recognize only its own prior side effect. Direct calls
+    # retain a random name and the strict preexisting-entitlement guard.
+    assignment_name = assignment_name or str(uuid.uuid4())
 
     # Get role definition ID
     role_definition_id = get_role_definition_id(role_name, subscription_id)
 
-    # Create role assignment (handle existing assignment conflicts gracefully)
+    matches = _matching_role_assignments(
+        auth_client,
+        sp_object_id=sp_object_id,
+        scope=scope,
+        role_name=role_name,
+    )
+    owned_assignment = next(
+        (
+            existing
+            for existing in matches
+            if preflight_recorded
+            and _assignment_name(existing).casefold() == assignment_name.casefold()
+        ),
+        None,
+    )
+    foreign_matches = [existing for existing in matches if existing is not owned_assignment]
+    if foreign_matches or (matches and owned_assignment is None):
+        raise PreexistingEntitlementError(
+            f"Service principal {sp_object_id} already has {role_name} on {scope}"
+        )
+
+    # Create role assignment
     assignment_params = RoleAssignmentCreateParameters(
         role_definition_id=role_definition_id,
         principal_id=sp_object_id,
         principal_type="ServicePrincipal"
     )
 
-    try:
-        assignment = auth_client.role_assignments.create(
-            scope=scope,
-            role_assignment_name=assignment_name,
-            parameters=assignment_params
-        )
-        assignment_id = assignment.id
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "conflict" in error_msg or "already exists" in error_msg:
-            logging.info(f"Role assignment already exists for {sp_object_id} on {scope}, looking up existing assignment")
-            # Find the existing assignment (filter only supports principalId, not compound)
-            existing = auth_client.role_assignments.list_for_scope(
+    created = owned_assignment is None
+    assignment = owned_assignment
+    if assignment is None:
+        try:
+            assignment = auth_client.role_assignments.create(
                 scope=scope,
-                filter=f"principalId eq '{sp_object_id}'"
+                role_assignment_name=assignment_name,
+                parameters=assignment_params
             )
-            matching = [a for a in existing if a.role_definition_id.endswith(ROLE_DEFINITIONS.get(role_name, ""))]
-            if matching:
-                assignment_id = matching[0].id
+        except Exception as exc:
+            if exception_error_code(exc) == "RoleAssignmentExists":
+                # A prior activity attempt may have committed the deterministic
+                # assignment before its completion event reached Durable storage.
+                # Re-read and adopt only that exact saga-owned assignment name.
+                retry_matches = _matching_role_assignments(
+                    auth_client,
+                    sp_object_id=sp_object_id,
+                    scope=scope,
+                    role_name=role_name,
+                )
+                assignment = next(
+                    (
+                        existing
+                        for existing in retry_matches
+                        if preflight_recorded
+                        and _assignment_name(existing).casefold() == assignment_name.casefold()
+                    ),
+                    None,
+                )
+                if assignment is None or any(
+                    existing is not assignment for existing in retry_matches
+                ):
+                    raise PreexistingEntitlementError(
+                        f"Service principal {sp_object_id} already has {role_name} on {scope}"
+                    ) from exc
+                created = False
             else:
                 raise
-        else:
-            raise
 
-    expiry_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+    expiry_value = expires_at or (
+        datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
+    ).isoformat()
+    assignment_id = getattr(assignment, "id", None) or (
+        f"{scope.rstrip('/')}/providers/Microsoft.Authorization/"
+        f"roleAssignments/{assignment_name}"
+    )
 
-    logging.info(f"Role assignment ready: {assignment_id}, expires at {expiry_time.isoformat()}")
+    logging.info(
+        "Role assignment %s: %s, expires at %s",
+        "created" if created else "resumed",
+        assignment_id,
+        expiry_value,
+    )
 
     return {
         "status": "granted",
         "assignment_id": assignment_id,
-        "assignment_name": assignment_name,
+        "assignment_name": getattr(assignment, "name", None) or assignment_name,
         "sp_object_id": sp_object_id,
         "scope": scope,
         "role": role_name,
-        "expires_at": expiry_time.isoformat(),
+        "expires_at": expiry_value,
         "duration_minutes": duration_minutes,
-        "workflow_id": workflow_id
+        "workflow_id": workflow_id,
+        "created": created,
     }
 
 
-async def revoke_nhi_access(assignment_id: str) -> dict:
+async def revoke_nhi_access(
+    assignment_id: str,
+    *,
+    auth_client=None,
+) -> dict:
     """
     Revoke NHI access by deleting the role assignment.
 
@@ -135,15 +261,16 @@ async def revoke_nhi_access(assignment_id: str) -> dict:
     """
     logging.info(f"Revoking NHI access: assignment={assignment_id}")
 
-    credential = DefaultAzureCredential()
-
     # Extract subscription ID from assignment ID
     # Format: /subscriptions/{sub}/providers/.../roleAssignments/{name}
     # or: /subscriptions/{sub}/resourceGroups/{rg}/providers/.../roleAssignments/{name}
     parts = assignment_id.split("/")
-    subscription_id = parts[parts.index("subscriptions") + 1]
+    normalized_parts = [part.casefold() for part in parts]
+    subscription_id = parts[normalized_parts.index("subscriptions") + 1]
 
-    auth_client = AuthorizationManagementClient(credential, subscription_id)
+    if auth_client is None:
+        credential = DefaultAzureCredential()
+        auth_client = AuthorizationManagementClient(credential, subscription_id)
 
     try:
         # Delete by ID
@@ -156,14 +283,18 @@ async def revoke_nhi_access(assignment_id: str) -> dict:
             "revoked_at": datetime.now(timezone.utc).isoformat()
         }
 
-    except Exception as e:
-        # Assignment might have been deleted manually or already expired
-        logging.warning(f"Could not delete role assignment: {e}")
-        return {
-            "status": "already_revoked",
-            "assignment_id": assignment_id,
-            "error": str(e)
-        }
+    except Exception as exc:
+        if is_explicit_not_found(exc):
+            logging.info("Role assignment was already absent: %s", assignment_id)
+            return {
+                "status": "already_revoked",
+                "assignment_id": assignment_id,
+            }
+
+        # Authentication, authorization, throttling, and service failures are
+        # genuine revoke failures and must be retried/alerted, not normalized.
+        logging.error("Failed to delete role assignment: %s", exc)
+        raise
 
 
 async def list_sp_role_assignments(sp_object_id: str, subscription_id: str) -> list:
