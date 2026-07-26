@@ -153,6 +153,38 @@ class ZspStaticSafetyTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is required")
+class ZspStandingPrivilegeCoverageTests(unittest.TestCase):
+    """The ownership guard is safe only if the privilege it leaves is findable."""
+
+    def test_readme_documents_the_ownership_lost_recovery_runbook(self) -> None:
+        readme = (LAB_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("ownership_lost", readme)
+        self.assertIn("Admin Lifecycle Ownership and Recovery", readme)
+        self.assertIn("Recovery runbook:", readme)
+        self.assertIn("only after", readme)
+        self.assertIn("Never clear the owner lock first", readme)
+
+    def test_readme_documents_the_standing_privilege_hunt_and_alert(self) -> None:
+        readme = (LAB_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("build_kql_query_unrevoked_expired_grants", readme)
+        self.assertIn("AccessRevoke", readme)
+        self.assertIn("Recommended alert", readme)
+
+    def test_orchestrator_audits_before_failing_on_ownership_loss(self) -> None:
+        source = (LAB_ROOT / "function" / "function_app.py").read_text(encoding="utf-8")
+        self.assertIn("record_ownership_lost_activity", source)
+        # Both refusal sites must audit: mid-grant compensation and expiry.
+        self.assertEqual(source.count('"phase": "compensation"'), 1)
+        self.assertEqual(source.count('"phase": "expiry"'), 1)
+        # The audit must be emitted before the raise, never instead of it.
+        for phase in ("compensation", "expiry"):
+            marker = f'"phase": "{phase}"'
+            self.assertLess(
+                source.index(marker),
+                source.index("membership was not revoked", source.index(marker)),
+            )
+
+
 class ZspPowerShellRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

@@ -140,6 +140,23 @@ class AuditWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(logs[0]["Justification"], "Incident response investigation")
         self.assertTrue(logs[0]["TimeGenerated"].endswith("+00:00"))
 
+    def test_unrevoked_grant_hunt_is_wellformed_and_validates_input(self):
+        """The hunt that finds privilege the ownership guard leaves standing."""
+
+        query = audit.build_kql_query_unrevoked_expired_grants()
+        self.assertIn("let grace = 15m;", query)
+        self.assertIn('EventType == "AccessGrant"', query)
+        self.assertIn('EventType == "AccessRevoke"', query)
+        self.assertIn("kind=leftouter", query)
+        self.assertIn("isnull(RevokeTime)", query)
+        self.assertIn(
+            "let grace = 30m;", audit.build_kql_query_unrevoked_expired_grants(30)
+        )
+        for bad in (0, -5, True, "15"):
+            with self.subTest(grace=bad):
+                with self.assertRaises(ValueError):
+                    audit.build_kql_query_unrevoked_expired_grants(bad)
+
     async def test_unconfigured_dcr_skips_the_write(self):
         client = FakeIngestionClient()
 

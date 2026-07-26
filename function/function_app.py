@@ -670,6 +670,26 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                         "status": "ownership_lost",
                         "expires_at": expiry_value,
                     })
+                    # The refusal to delete is deliberate, but it can leave a live
+                    # entitlement behind. Record that in ZSPAudit_CL before failing
+                    # so the stranded grant is discoverable from the audit table
+                    # rather than only from Durable instance history.
+                    try:
+                        yield context.call_activity_with_retry(
+                            "record_ownership_lost_activity",
+                            retry_options,
+                            {
+                                "user_id": admin_owner_payload["user_id"],
+                                "group_id": admin_owner_payload["group_id"],
+                                "requested_by": requested_by,
+                                "expires_at": expiry_value,
+                                "phase": "compensation",
+                            },
+                        )
+                    except Exception:
+                        # An audit transport failure must not mask the ownership
+                        # error and must never turn into a deletion.
+                        pass
                     raise RuntimeError(
                         "Admin ownership could not be proven during compensation; membership was not revoked"
                     ) from grant_error
@@ -723,6 +743,25 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                 "status": "ownership_lost",
                 "expires_at": expiry_value,
             })
+            # Expiry is the failure that matters most: the grant is past its
+            # deadline and is deliberately not being revoked, so it must appear
+            # in ZSPAudit_CL for the unmatched-expired-grant hunt to find it.
+            try:
+                yield context.call_activity_with_retry(
+                    "record_ownership_lost_activity",
+                    retry_options,
+                    {
+                        "user_id": admin_owner_payload["user_id"],
+                        "group_id": admin_owner_payload["group_id"],
+                        "requested_by": requested_by,
+                        "expires_at": expiry_value,
+                        "phase": "expiry",
+                    },
+                )
+            except Exception:
+                # An audit transport failure must not mask the ownership error
+                # and must never turn into a deletion.
+                pass
             raise RuntimeError(
                 "Admin ownership could not be proven at expiry; membership was not revoked"
             )
@@ -983,6 +1022,37 @@ async def revoke_role_assignment_activity(activityPayload):
         result="Success",
     )
     return result
+
+
+@app.activity_trigger(input_name="activityPayload")
+async def record_ownership_lost_activity(activityPayload):
+    """Record a deliberately un-revoked entitlement in ZSPAudit_CL.
+
+    The orchestrator refuses to delete a group membership it cannot prove it
+    owns, because Graph membership edges carry no owner token and a blind
+    delete could remove a newer, independently managed entitlement. That is the
+    right call, but it can leave temporary privilege in place. Without this row
+    the only trace is Durable instance history, which no KQL hunt reads.
+    """
+
+    input_data = _activity_payload(activityPayload)
+    phase = str(input_data.get("phase", "unknown"))
+    await log_access_event(
+        event_type="AccessRevoke",
+        identity_type="human",
+        principal_id=input_data["user_id"],
+        target=input_data["group_id"],
+        target_type="EntraGroup",
+        expires_at=input_data.get("expires_at"),
+        requested_by=input_data.get("requested_by"),
+        result="Failed",
+        error_message=(
+            f"ownership_lost during {phase}: the lifecycle could not prove it owns "
+            "this membership, so it was intentionally not revoked and may still be "
+            "active. Follow the manual recovery runbook in README.md."
+        ),
+    )
+    return {"status": "ownership_lost_recorded", "phase": phase}
 
 
 # =============================================================================

@@ -788,6 +788,76 @@ class OrchestratorTests(unittest.TestCase):
             generator.send({"released": True, "owner": context.instance_id})
         self.assertEqual(completed.exception.value["status"], "revoked")
 
+    def _run_admin_to_expiry_ownership_loss(self, context):
+        """Drive an admin lifecycle to the expiry ownership-loss branch."""
+
+        generator = function_app.access_lifecycle_orchestrator(context)
+        next(generator)
+        generator.send({"claimed": True, "owner": context.instance_id})
+        generator.send({"status": "absent"})
+        generator.send({"status": "granted", "created": True})
+        generator.send(None)
+        audit = generator.send({"owned": False, "owner": "other-instance"})
+        return generator, audit
+
+    def test_expiry_ownership_loss_audits_and_never_deletes(self):
+        context = FakeOrchestrationContext(self._admin_input())
+        generator, audit = self._run_admin_to_expiry_ownership_loss(context)
+
+        # The stranded entitlement must reach ZSPAudit_CL, not just Durable history.
+        self.assertEqual(audit[0], "activity")
+        self.assertEqual(audit[1], "record_ownership_lost_activity")
+        self.assertEqual(audit[2]["phase"], "expiry")
+        self.assertEqual(audit[2]["user_id"], USER_ID)
+        self.assertEqual(audit[2]["group_id"], GROUP_ID)
+
+        with self.assertRaisesRegex(RuntimeError, "membership was not revoked"):
+            generator.send({"status": "ownership_lost_recorded"})
+
+        scheduled = [name for name, _, _ in context.activity_calls]
+        self.assertIn("record_ownership_lost_activity", scheduled)
+        # No unsafe deletion: revocation must never be scheduled once ownership
+        # cannot be proven.
+        self.assertNotIn("revoke_group_membership_activity", scheduled)
+        self.assertEqual(context.task_all_calls, [])
+        # The owner lock is retained so a later lifecycle cannot silently adopt
+        # and then delete this membership.
+        self.assertNotIn("release", [op for _, op, _ in context.entity_calls])
+        self.assertEqual(context.custom_statuses[-1]["status"], "ownership_lost")
+
+    def test_expiry_audit_failure_does_not_mask_error_or_cause_deletion(self):
+        context = FakeOrchestrationContext(self._admin_input())
+        generator, _ = self._run_admin_to_expiry_ownership_loss(context)
+
+        # Even if the audit transport is down, the ownership error is what
+        # surfaces, and nothing gets deleted.
+        with self.assertRaisesRegex(RuntimeError, "membership was not revoked"):
+            generator.throw(RuntimeError("audit unavailable"))
+
+        scheduled = [name for name, _, _ in context.activity_calls]
+        self.assertNotIn("revoke_group_membership_activity", scheduled)
+        self.assertNotIn("release", [op for _, op, _ in context.entity_calls])
+
+    def test_compensation_ownership_loss_audits_with_its_own_phase(self):
+        context = FakeOrchestrationContext(self._admin_input())
+        generator = function_app.access_lifecycle_orchestrator(context)
+
+        next(generator)
+        generator.send({"claimed": True, "owner": context.instance_id})
+        generator.send({"status": "absent"})
+        generator.throw(RuntimeError("grant result lost"))
+        audit = generator.send({"owned": False, "owner": "other-instance"})
+
+        self.assertEqual(audit[1], "record_ownership_lost_activity")
+        self.assertEqual(audit[2]["phase"], "compensation")
+
+        with self.assertRaisesRegex(RuntimeError, "membership was not revoked"):
+            generator.send({"status": "ownership_lost_recorded"})
+
+        scheduled = [name for name, _, _ in context.activity_calls]
+        self.assertNotIn("revoke_group_membership_activity", scheduled)
+        self.assertNotIn("release", [op for _, op, _ in context.entity_calls])
+
     def test_concurrent_admin_claim_is_rejected_before_preflight(self):
         context = FakeOrchestrationContext(self._admin_input())
         generator = function_app.access_lifecycle_orchestrator(context)

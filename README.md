@@ -310,6 +310,68 @@ IDs. Requests outside those allowlists are rejected.
 
 ---
 
+## Admin Lifecycle Ownership and Recovery
+
+A Durable Entity serializes ownership of each user/group membership. Only the
+lifecycle that claimed that entity may revoke the membership it created.
+
+If the entity can no longer prove ownership, the orchestrator sets
+`customStatus.status` to `ownership_lost`, records a `Result == "Failed"`
+`AccessRevoke` row in `ZSPAudit_CL`, and fails **without deleting the
+membership**. That refusal is deliberate: Graph membership edges carry no owner
+token, so a blind delete could remove a newer or independently managed
+entitlement. The cost is that temporary privilege can remain live, so this state
+requires manual recovery.
+
+Recovery runbook:
+
+1. Stop issuing new requests for that user/group pair.
+2. Correlate the Durable instance history, Entra ID audit logs, and current group
+   membership to establish which lifecycle actually created the membership.
+3. Remove the user manually **only after** that attribution is confirmed.
+4. Once the entitlement is confirmed absent, repair or purge that owner entity.
+   A task-hub reset or redeployment is the fallback in this disposable lab.
+5. Verify the membership is gone, then resume normal operation.
+
+Never clear the owner lock first, and never change privileged ZSP group
+memberships manually while a lifecycle is active.
+
+### Hunting for standing privilege
+
+`build_kql_query_unrevoked_expired_grants()` in `function/audit.py` returns the
+hunt for the failure this design can produce: a grant that is past its expiry
+with no matching successful `AccessRevoke`. Run it on a schedule and alert on any
+result, because every row is an entitlement that outlived its deadline.
+
+```kusto
+let grace = 15m;
+let grants =
+    ZSPAudit_CL
+    | where EventType == "AccessGrant" and Result == "Success"
+    | where isnotempty(ExpiresAt)
+    | extend Expiry = todatetime(ExpiresAt)
+    | project GrantTime = TimeGenerated, PrincipalId, Target, Role, IdentityType, Expiry;
+let revokes =
+    ZSPAudit_CL
+    | where EventType == "AccessRevoke" and Result == "Success"
+    | project RevokeTime = TimeGenerated, PrincipalId, Target;
+grants
+| where Expiry < ago(grace)
+| join kind=leftouter revokes on PrincipalId, Target
+| where isnull(RevokeTime) or RevokeTime < GrantTime
+| summarize Grants = count(), LastGrant = max(GrantTime), LastExpiry = max(Expiry)
+  by PrincipalId, Target, Role, IdentityType
+| extend MinutesOverdue = datetime_diff('minute', now(), LastExpiry)
+| order by MinutesOverdue desc
+```
+
+Recommended alert: a Sentinel scheduled analytics rule running this query every
+15 minutes over a 24-hour lookback, severity High, with any result creating an
+incident. Pair it with an alert on `customStatus.status == "ownership_lost"` if
+you forward Durable instance telemetry.
+
+---
+
 ## Cleanup
 
 Before cleanup, stop new requests, poll all Durable instances, revoke/verify
