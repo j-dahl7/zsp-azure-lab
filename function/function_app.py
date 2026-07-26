@@ -23,7 +23,11 @@ from nhi_access import (
     grant_nhi_access,
     revoke_nhi_access,
 )
-from audit import log_access_event
+from audit import (
+    audit_configuration_status,
+    log_access_event,
+    require_audit_configuration,
+)
 from access_safety import (
     PreexistingEntitlementError,
     RequestValidationError,
@@ -242,6 +246,15 @@ async def _start_access_lifecycle(req, client, client_input: dict) -> func.HttpR
     """Persist orchestration history before any grant activity can execute."""
 
     try:
+        require_audit_configuration()
+    except Exception as exc:
+        logging.error("Audit ingestion is not ready; refusing access request: %s", exc)
+        return _json_response(
+            {"error": "Audit logging is not configured; no access was granted"},
+            503,
+        )
+
+    try:
         instance_id = await client.start_new(
             "access_lifecycle_orchestrator",
             client_input=client_input,
@@ -437,6 +450,7 @@ async def backup_job_access_grant(timer: func.TimerRequest, client):
         return
 
     try:
+        require_audit_configuration()
         grants = []
         for scope, role in (
             (keyvault_id, "Key Vault Secrets User"),
@@ -545,14 +559,19 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
 
     for grant_index, grant in enumerate(grants):
         if access_type == "admin":
+            entitlement_id = build_admin_ownership_key(
+                grant["user_id"], grant["group_id"]
+            )
             admin_owner_payload = {
                 "orchestration_instance_id": instance_id,
                 "user_id": grant["user_id"],
                 "group_id": grant["group_id"],
+                "lifecycle_id": instance_id,
+                "entitlement_id": entitlement_id,
             }
             admin_owner_entity = df.EntityId(
                 ADMIN_OWNER_ENTITY_NAME,
-                build_admin_ownership_key(grant["user_id"], grant["group_id"]),
+                entitlement_id,
             )
             activity_payload = {
                 "user_id": grant["user_id"],
@@ -563,6 +582,8 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                 "expires_at": expiry_value,
                 "requested_by": requested_by,
                 "orchestration_instance_id": instance_id,
+                "lifecycle_id": instance_id,
+                "entitlement_id": entitlement_id,
             }
             preflight_activity = "check_admin_entitlement_activity"
             grant_activity = "grant_admin_access_activity"
@@ -572,6 +593,9 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                 "user_id": grant["user_id"],
                 "group_id": grant["group_id"],
                 "requested_by": requested_by,
+                "expires_at": expiry_value,
+                "lifecycle_id": instance_id,
+                "entitlement_id": entitlement_id,
             }
         else:
             assignment_name = build_nhi_assignment_name(
@@ -593,6 +617,8 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                 "expires_at": expiry_value,
                 "requested_by": requested_by,
                 "orchestration_instance_id": instance_id,
+                "lifecycle_id": instance_id,
+                "entitlement_id": assignment_id,
             }
             preflight_activity = "check_nhi_entitlement_activity"
             grant_activity = "grant_nhi_access_activity"
@@ -604,6 +630,9 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                 "scope": grant["scope"],
                 "role": grant["role"],
                 "requested_by": requested_by,
+                "expires_at": expiry_value,
+                "lifecycle_id": instance_id,
+                "entitlement_id": assignment_id,
             }
 
         preflight_succeeded = False
@@ -656,11 +685,39 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
             # Never remove a group membership unless the serialized ownership
             # entity still proves that this exact lifecycle owns it.
             if cleanup and admin_owner_claimed:
-                verify_result = yield context.call_entity(
-                    admin_owner_entity,
-                    "verify",
-                    admin_owner_payload,
-                )
+                try:
+                    verify_result = yield context.call_entity(
+                        admin_owner_entity,
+                        "verify",
+                        admin_owner_payload,
+                    )
+                except Exception as verification_error:
+                    context.set_custom_status({
+                        "status": "ownership_unverified",
+                        "expires_at": expiry_value,
+                    })
+                    try:
+                        yield context.call_activity_with_retry(
+                            "record_ownership_unverified_activity",
+                            retry_options,
+                            {
+                                "user_id": admin_owner_payload["user_id"],
+                                "group_id": admin_owner_payload["group_id"],
+                                "requested_by": requested_by,
+                                "expires_at": expiry_value,
+                                "lifecycle_id": admin_owner_payload["lifecycle_id"],
+                                "entitlement_id": admin_owner_payload["entitlement_id"],
+                                "phase": "compensation",
+                                "verification_error": str(verification_error),
+                            },
+                        )
+                    except Exception:
+                        # Preserve the owner lock and the verification failure;
+                        # an unavailable audit path must never authorize delete.
+                        pass
+                    raise RuntimeError(
+                        "Admin ownership verification failed during compensation; membership was not revoked"
+                    ) from verification_error
                 if (
                     not isinstance(verify_result, dict)
                     or not verify_result.get("owned")
@@ -683,6 +740,8 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                                 "group_id": admin_owner_payload["group_id"],
                                 "requested_by": requested_by,
                                 "expires_at": expiry_value,
+                                "lifecycle_id": admin_owner_payload["lifecycle_id"],
+                                "entitlement_id": admin_owner_payload["entitlement_id"],
                                 "phase": "compensation",
                             },
                         )
@@ -729,11 +788,39 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
         "grant_count": len(owned_revocations),
     })
     if admin_owner_claimed:
-        verify_result = yield context.call_entity(
-            admin_owner_entity,
-            "verify",
-            admin_owner_payload,
-        )
+        try:
+            verify_result = yield context.call_entity(
+                admin_owner_entity,
+                "verify",
+                admin_owner_payload,
+            )
+        except Exception as verification_error:
+            context.set_custom_status({
+                "status": "ownership_unverified",
+                "expires_at": expiry_value,
+            })
+            try:
+                yield context.call_activity_with_retry(
+                    "record_ownership_unverified_activity",
+                    retry_options,
+                    {
+                        "user_id": admin_owner_payload["user_id"],
+                        "group_id": admin_owner_payload["group_id"],
+                        "requested_by": requested_by,
+                        "expires_at": expiry_value,
+                        "lifecycle_id": admin_owner_payload["lifecycle_id"],
+                        "entitlement_id": admin_owner_payload["entitlement_id"],
+                        "phase": "expiry",
+                        "verification_error": str(verification_error),
+                    },
+                )
+            except Exception:
+                # Keep the lock and fail closed even when the observability
+                # write cannot be completed.
+                pass
+            raise RuntimeError(
+                "Admin ownership verification failed at expiry; membership was not revoked"
+            ) from verification_error
         if (
             not isinstance(verify_result, dict)
             or not verify_result.get("owned")
@@ -755,6 +842,8 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
                         "group_id": admin_owner_payload["group_id"],
                         "requested_by": requested_by,
                         "expires_at": expiry_value,
+                        "lifecycle_id": admin_owner_payload["lifecycle_id"],
+                        "entitlement_id": admin_owner_payload["entitlement_id"],
                         "phase": "expiry",
                     },
                 )
@@ -858,6 +947,16 @@ async def grant_admin_access_activity(activityPayload):
     """Idempotently add a member after the recorded absence preflight."""
 
     input_data = _activity_payload(activityPayload)
+    # Refuse the side effect itself when audit configuration is unavailable.
+    # Admission also checks this, but an accepted Durable instance can outlive
+    # an app-setting change or be replayed after a deployment.
+    require_audit_configuration()
+    lifecycle_id = input_data.get("lifecycle_id") or input_data.get(
+        "orchestration_instance_id"
+    )
+    entitlement_id = input_data.get("entitlement_id") or build_admin_ownership_key(
+        input_data["user_id"], input_data["group_id"]
+    )
     try:
         result = await grant_admin_access(
             user_id=input_data["user_id"],
@@ -879,6 +978,8 @@ async def grant_admin_access_activity(activityPayload):
             duration_minutes=input_data["duration_minutes"],
             justification=input_data["justification"],
             ticket_id=input_data.get("ticket_id"),
+            lifecycle_id=lifecycle_id,
+            entitlement_id=entitlement_id,
             expires_at=input_data["expires_at"],
             requested_by=input_data.get("requested_by"),
         )
@@ -892,6 +993,8 @@ async def grant_admin_access_activity(activityPayload):
         duration_minutes=input_data["duration_minutes"],
         justification=input_data["justification"],
         ticket_id=input_data.get("ticket_id"),
+        lifecycle_id=lifecycle_id,
+        entitlement_id=entitlement_id,
         expires_at=input_data["expires_at"],
         requested_by=input_data.get("requested_by"),
         result="Success",
@@ -917,6 +1020,13 @@ async def grant_nhi_access_activity(activityPayload):
     """Create or resume only this saga's deterministic RBAC assignment."""
 
     input_data = _activity_payload(activityPayload)
+    require_audit_configuration()
+    lifecycle_id = input_data.get("lifecycle_id") or input_data.get(
+        "orchestration_instance_id"
+    )
+    entitlement_id = input_data.get("entitlement_id") or input_data.get(
+        "assignment_id"
+    )
     try:
         result = await grant_nhi_access(
             sp_object_id=input_data["sp_object_id"],
@@ -939,6 +1049,8 @@ async def grant_nhi_access_activity(activityPayload):
             role=input_data["role"],
             duration_minutes=input_data["duration_minutes"],
             workflow_id=input_data["workflow_id"],
+            lifecycle_id=lifecycle_id,
+            entitlement_id=entitlement_id,
             expires_at=input_data["expires_at"],
             requested_by=input_data.get("requested_by"),
         )
@@ -952,6 +1064,8 @@ async def grant_nhi_access_activity(activityPayload):
         role=input_data["role"],
         duration_minutes=input_data["duration_minutes"],
         workflow_id=input_data["workflow_id"],
+        lifecycle_id=lifecycle_id,
+        entitlement_id=entitlement_id,
         expires_at=input_data["expires_at"],
         requested_by=input_data.get("requested_by"),
         result="Success",
@@ -977,6 +1091,9 @@ async def revoke_group_membership_activity(activityPayload):
             principal_id=input_data["user_id"],
             target=input_data["group_id"],
             target_type="EntraGroup",
+            lifecycle_id=input_data.get("lifecycle_id"),
+            entitlement_id=input_data.get("entitlement_id"),
+            expires_at=input_data.get("expires_at"),
             requested_by=input_data.get("requested_by"),
         )
         raise
@@ -986,6 +1103,9 @@ async def revoke_group_membership_activity(activityPayload):
         principal_id=input_data["user_id"],
         target=input_data["group_id"],
         target_type="EntraGroup",
+        lifecycle_id=input_data.get("lifecycle_id"),
+        entitlement_id=input_data.get("entitlement_id"),
+        expires_at=input_data.get("expires_at"),
         requested_by=input_data.get("requested_by"),
         result="Success",
     )
@@ -1008,6 +1128,11 @@ async def revoke_role_assignment_activity(activityPayload):
             target=input_data["scope"],
             target_type="AzureResource",
             role=input_data.get("role"),
+            lifecycle_id=input_data.get("lifecycle_id"),
+            entitlement_id=(
+                input_data.get("entitlement_id") or input_data.get("assignment_id")
+            ),
+            expires_at=input_data.get("expires_at"),
             requested_by=input_data.get("requested_by"),
         )
         raise
@@ -1018,6 +1143,11 @@ async def revoke_role_assignment_activity(activityPayload):
         target=input_data["scope"],
         target_type="AzureResource",
         role=input_data.get("role"),
+        lifecycle_id=input_data.get("lifecycle_id"),
+        entitlement_id=(
+            input_data.get("entitlement_id") or input_data.get("assignment_id")
+        ),
+        expires_at=input_data.get("expires_at"),
         requested_by=input_data.get("requested_by"),
         result="Success",
     )
@@ -1043,6 +1173,8 @@ async def record_ownership_lost_activity(activityPayload):
         principal_id=input_data["user_id"],
         target=input_data["group_id"],
         target_type="EntraGroup",
+        lifecycle_id=input_data.get("lifecycle_id"),
+        entitlement_id=input_data.get("entitlement_id"),
         expires_at=input_data.get("expires_at"),
         requested_by=input_data.get("requested_by"),
         result="Failed",
@@ -1055,19 +1187,55 @@ async def record_ownership_lost_activity(activityPayload):
     return {"status": "ownership_lost_recorded", "phase": phase}
 
 
+@app.activity_trigger(input_name="activityPayload")
+async def record_ownership_unverified_activity(activityPayload):
+    """Record that owner verification itself failed and no delete was attempted."""
+
+    input_data = _activity_payload(activityPayload)
+    phase = str(input_data.get("phase", "unknown"))
+    verification_error = str(input_data.get("verification_error", "unavailable"))
+    await log_access_event(
+        event_type="AccessRevoke",
+        identity_type="human",
+        principal_id=input_data["user_id"],
+        target=input_data["group_id"],
+        target_type="EntraGroup",
+        lifecycle_id=input_data.get("lifecycle_id"),
+        entitlement_id=input_data.get("entitlement_id"),
+        expires_at=input_data.get("expires_at"),
+        requested_by=input_data.get("requested_by"),
+        result="Failed",
+        error_message=(
+            f"ownership_unverified during {phase}: owner verification failed "
+            f"({verification_error}); the membership was intentionally not revoked "
+            "and may still be active. Follow the manual recovery runbook in README.md."
+        ),
+    )
+    return {"status": "ownership_unverified_recorded", "phase": phase}
+
+
 # =============================================================================
 # HEALTH CHECK
 # =============================================================================
 
 @app.route(route="api/health", methods=["GET"])
 def health_check(req: func.HttpRequest) -> func.HttpResponse:
-    """Simple health check endpoint."""
+    """Readiness check that fails when grants cannot be audited."""
+
+    audit_status = audit_configuration_status()
+    ready = bool(audit_status["ready"])
     return func.HttpResponse(
         json.dumps({
-            "status": "healthy",
+            "status": "healthy" if ready else "degraded",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "version": "1.0.0"
+            "version": "1.1.0",
+            "checks": {
+                "audit_logging": {
+                    "status": "ready" if ready else "not_ready",
+                    "issues": audit_status["issues"],
+                }
+            },
         }),
-        status_code=200,
+        status_code=200 if ready else 503,
         mimetype="application/json"
     )

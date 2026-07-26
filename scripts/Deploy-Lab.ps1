@@ -354,6 +354,8 @@ $tableBody = @{
                 @{ name = "Justification"; type = "string" }
                 @{ name = "TicketId"; type = "string" }
                 @{ name = "WorkflowId"; type = "string" }
+                @{ name = "LifecycleId"; type = "string" }
+                @{ name = "EntitlementId"; type = "string" }
                 @{ name = "ExpiresAt"; type = "string" }
                 @{ name = "RequestedBy"; type = "string" }
                 @{ name = "Result"; type = "string" }
@@ -396,6 +398,8 @@ $dcrBody = @{
                     @{ name = "Justification"; type = "string" }
                     @{ name = "TicketId"; type = "string" }
                     @{ name = "WorkflowId"; type = "string" }
+                    @{ name = "LifecycleId"; type = "string" }
+                    @{ name = "EntitlementId"; type = "string" }
                     @{ name = "ExpiresAt"; type = "string" }
                     @{ name = "RequestedBy"; type = "string" }
                     @{ name = "Result"; type = "string" }
