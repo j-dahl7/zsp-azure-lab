@@ -105,6 +105,8 @@ nhi_module.ROLE_DEFINITIONS = dict.fromkeys(
 )
 audit_module = _module("audit")
 audit_module.log_access_event = _placeholder
+audit_module.require_audit_configuration = lambda: ("https://dce.example", "dcr-test")
+audit_module.audit_configuration_status = lambda: {"ready": True, "issues": []}
 
 from access_safety import (  # noqa: E402
     PreexistingEntitlementError,
@@ -272,6 +274,87 @@ class EndpointSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["access_type"], "nhi_bundle")
         self.assertEqual(len(payload["grants"]), 2)
         grant.assert_not_awaited()
+
+    async def test_missing_audit_configuration_refuses_request_before_history(self):
+        client = FakeDurableClient()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "ALLOWED_ADMIN_USER_IDS": USER_ID,
+                    "ALLOWED_ADMIN_GROUP_IDS": GROUP_ID,
+                },
+                clear=True,
+            ),
+            patch.object(
+                function_app,
+                "require_audit_configuration",
+                side_effect=RuntimeError("DCR_ENDPOINT is missing"),
+            ),
+        ):
+            response = await function_app.admin_access_request(
+                FakeRequest(
+                    {
+                        "user_id": USER_ID,
+                        "group_id": GROUP_ID,
+                        "duration_minutes": 60,
+                        "justification": "Incident response investigation",
+                    }
+                ),
+                client,
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("no access was granted", json.loads(response.body)["error"])
+        self.assertEqual(client.calls, [])
+
+    async def test_backup_timer_refuses_to_schedule_without_audit_configuration(self):
+        storage_scope = SCOPE.replace(
+            "Microsoft.KeyVault/vaults/example",
+            "Microsoft.Storage/storageAccounts/example",
+        )
+        client = FakeDurableClient()
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "BACKUP_SP_OBJECT_ID": SP_ID,
+                    "KEYVAULT_RESOURCE_ID": SCOPE,
+                    "STORAGE_RESOURCE_ID": storage_scope,
+                },
+                clear=True,
+            ),
+            patch.object(
+                function_app,
+                "require_audit_configuration",
+                side_effect=RuntimeError("DCR_ENDPOINT is missing"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "DCR_ENDPOINT is missing"):
+                await function_app.backup_job_access_grant(object(), client)
+
+        self.assertEqual(client.calls, [])
+
+    def test_health_is_degraded_when_audit_logging_is_not_ready(self):
+        with patch.object(
+            function_app,
+            "audit_configuration_status",
+            return_value={"ready": False, "issues": ["DCR_RULE_ID is missing"]},
+        ):
+            response = function_app.health_check(FakeRequest(None))
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["checks"]["audit_logging"]["status"], "not_ready")
+
+    def test_health_is_healthy_when_audit_logging_is_ready(self):
+        response = function_app.health_check(FakeRequest(None))
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["status"], "healthy")
+        self.assertEqual(payload["checks"]["audit_logging"]["status"], "ready")
 
 
 class EndpointAllowlistTests(unittest.IsolatedAsyncioTestCase):
@@ -550,6 +633,53 @@ class AdminOwnershipEntityTests(unittest.TestCase):
 
 
 class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_grant_activity_checks_audit_readiness_before_side_effect(self):
+        grant = AsyncMock()
+        with (
+            patch.object(
+                function_app,
+                "require_audit_configuration",
+                side_effect=RuntimeError("audit not ready"),
+            ),
+            patch.object(function_app, "grant_admin_access", new=grant),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit not ready"):
+                await function_app.grant_admin_access_activity(
+                    {
+                        "user_id": USER_ID,
+                        "group_id": GROUP_ID,
+                        "duration_minutes": 60,
+                        "justification": "Incident response",
+                        "expires_at": "2026-07-10T19:00:00+00:00",
+                    }
+                )
+
+        grant.assert_not_awaited()
+
+    async def test_successful_admin_grant_audits_exact_ids(self):
+        audit = AsyncMock()
+        grant = AsyncMock(return_value={"status": "granted", "created": True})
+        with (
+            patch.object(function_app, "grant_admin_access", new=grant),
+            patch.object(function_app, "log_access_event", new=audit),
+        ):
+            await function_app.grant_admin_access_activity(
+                {
+                    "user_id": USER_ID,
+                    "group_id": GROUP_ID,
+                    "duration_minutes": 60,
+                    "justification": "Incident response",
+                    "expires_at": "2026-07-10T19:00:00+00:00",
+                    "lifecycle_id": "admin-lifecycle",
+                    "entitlement_id": "admin-membership",
+                }
+            )
+
+        fields = audit.await_args.kwargs
+        self.assertEqual(fields["result"], "Success")
+        self.assertEqual(fields["lifecycle_id"], "admin-lifecycle")
+        self.assertEqual(fields["entitlement_id"], "admin-membership")
+
     async def test_grant_and_revoke_failures_are_audited_and_reraised(self):
         expires_at = "2026-07-10T19:00:00+00:00"
         assignment_id = (
@@ -568,6 +698,8 @@ class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
                     "justification": "Incident response",
                     "ticket_id": "INC-1234",
                     "expires_at": expires_at,
+                    "lifecycle_id": "admin-lifecycle",
+                    "entitlement_id": "admin-membership",
                 },
                 "AccessGrant",
                 "human",
@@ -585,7 +717,10 @@ class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
                     "duration_minutes": 30,
                     "workflow_id": "nightly-backup",
                     "assignment_name": "55555555-5555-4555-8555-555555555555",
+                    "assignment_id": assignment_id,
                     "expires_at": expires_at,
+                    "lifecycle_id": "nhi-lifecycle",
+                    "entitlement_id": assignment_id,
                 },
                 "AccessGrant",
                 "nhi",
@@ -596,7 +731,12 @@ class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
                 "admin revoke",
                 function_app.revoke_group_membership_activity,
                 "revoke_admin_access",
-                {"user_id": USER_ID, "group_id": GROUP_ID},
+                {
+                    "user_id": USER_ID,
+                    "group_id": GROUP_ID,
+                    "lifecycle_id": "admin-lifecycle",
+                    "entitlement_id": "admin-membership",
+                },
                 "AccessRevoke",
                 "human",
                 USER_ID,
@@ -611,6 +751,8 @@ class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
                     "sp_object_id": SP_ID,
                     "scope": SCOPE,
                     "role": "Key Vault Secrets User",
+                    "lifecycle_id": "nhi-lifecycle",
+                    "entitlement_id": assignment_id,
                 },
                 "AccessRevoke",
                 "nhi",
@@ -652,6 +794,12 @@ class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(audit_fields["target"], target)
                 self.assertEqual(audit_fields["result"], "Failed")
                 self.assertEqual(audit_fields["error_message"], str(operation_error))
+                self.assertEqual(
+                    audit_fields["lifecycle_id"], payload["lifecycle_id"]
+                )
+                self.assertEqual(
+                    audit_fields["entitlement_id"], payload["entitlement_id"]
+                )
 
     async def test_audit_transport_failure_does_not_mask_activity_failure(self):
         operation_error = RuntimeError("revocation failed")
@@ -674,6 +822,45 @@ class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertIs(caught.exception, operation_error)
+
+    async def test_ownership_unverified_activity_records_exact_ids(self):
+        audit = AsyncMock()
+        with patch.object(function_app, "log_access_event", new=audit):
+            result = await function_app.record_ownership_unverified_activity(
+                {
+                    "user_id": USER_ID,
+                    "group_id": GROUP_ID,
+                    "lifecycle_id": "admin-lifecycle",
+                    "entitlement_id": "admin-membership",
+                    "phase": "expiry",
+                    "verification_error": "entity storage unavailable",
+                }
+            )
+
+        self.assertEqual(result["status"], "ownership_unverified_recorded")
+        fields = audit.await_args.kwargs
+        self.assertEqual(fields["lifecycle_id"], "admin-lifecycle")
+        self.assertEqual(fields["entitlement_id"], "admin-membership")
+        self.assertIn("ownership_unverified during expiry", fields["error_message"])
+
+    async def test_ownership_lost_activity_records_exact_ids(self):
+        audit = AsyncMock()
+        with patch.object(function_app, "log_access_event", new=audit):
+            result = await function_app.record_ownership_lost_activity(
+                {
+                    "user_id": USER_ID,
+                    "group_id": GROUP_ID,
+                    "lifecycle_id": "admin-lifecycle",
+                    "entitlement_id": "admin-membership",
+                    "phase": "compensation",
+                }
+            )
+
+        self.assertEqual(result["status"], "ownership_lost_recorded")
+        fields = audit.await_args.kwargs
+        self.assertEqual(fields["lifecycle_id"], "admin-lifecycle")
+        self.assertEqual(fields["entitlement_id"], "admin-membership")
+        self.assertIn("ownership_lost during compensation", fields["error_message"])
 
 
 class OrchestratorTests(unittest.TestCase):
@@ -714,6 +901,8 @@ class OrchestratorTests(unittest.TestCase):
             grant_payload["assignment_id"],
             build_nhi_assignment_id(SCOPE, expected_name),
         )
+        self.assertEqual(grant_payload["lifecycle_id"], context.instance_id)
+        self.assertEqual(grant_payload["entitlement_id"], grant_payload["assignment_id"])
 
         grant_result = {
             "status": "granted",
@@ -728,6 +917,10 @@ class OrchestratorTests(unittest.TestCase):
         revoke_all = generator.send(None)
         self.assertEqual(revoke_all[0], "all")
         self.assertEqual(revoke_all[1][0][1], "revoke_role_assignment_activity")
+        self.assertEqual(revoke_all[1][0][2]["lifecycle_id"], context.instance_id)
+        self.assertEqual(
+            revoke_all[1][0][2]["entitlement_id"], grant_payload["assignment_id"]
+        )
         with self.assertRaises(StopIteration) as completed:
             generator.send([{"status": "revoked"}])
 
@@ -810,6 +1003,8 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(audit[2]["phase"], "expiry")
         self.assertEqual(audit[2]["user_id"], USER_ID)
         self.assertEqual(audit[2]["group_id"], GROUP_ID)
+        self.assertEqual(audit[2]["lifecycle_id"], context.instance_id)
+        self.assertTrue(audit[2]["entitlement_id"])
 
         with self.assertRaisesRegex(RuntimeError, "membership was not revoked"):
             generator.send({"status": "ownership_lost_recorded"})
@@ -857,6 +1052,53 @@ class OrchestratorTests(unittest.TestCase):
         scheduled = [name for name, _, _ in context.activity_calls]
         self.assertNotIn("revoke_group_membership_activity", scheduled)
         self.assertNotIn("release", [op for _, op, _ in context.entity_calls])
+
+    def test_compensation_verification_exception_is_audited_without_delete(self):
+        context = FakeOrchestrationContext(self._admin_input())
+        generator = function_app.access_lifecycle_orchestrator(context)
+
+        next(generator)
+        generator.send({"claimed": True, "owner": context.instance_id})
+        generator.send({"status": "absent"})
+        verify = generator.throw(RuntimeError("grant completion was lost"))
+        self.assertEqual(verify[0:2], ("entity", "verify"))
+
+        audit = generator.throw(RuntimeError("entity storage unavailable"))
+        self.assertEqual(audit[1], "record_ownership_unverified_activity")
+        self.assertEqual(audit[2]["phase"], "compensation")
+        self.assertEqual(audit[2]["lifecycle_id"], context.instance_id)
+
+        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+            generator.send({"status": "ownership_unverified_recorded"})
+
+        scheduled = [name for name, _, _ in context.activity_calls]
+        self.assertNotIn("revoke_group_membership_activity", scheduled)
+        self.assertNotIn("release", [op for _, op, _ in context.entity_calls])
+        self.assertEqual(context.custom_statuses[-1]["status"], "ownership_unverified")
+
+    def test_expiry_verification_exception_is_audited_without_delete(self):
+        context = FakeOrchestrationContext(self._admin_input())
+        generator = function_app.access_lifecycle_orchestrator(context)
+
+        next(generator)
+        generator.send({"claimed": True, "owner": context.instance_id})
+        generator.send({"status": "absent"})
+        generator.send({"status": "granted", "created": True})
+        verify = generator.send(None)
+        self.assertEqual(verify[0:2], ("entity", "verify"))
+
+        audit = generator.throw(RuntimeError("entity storage unavailable"))
+        self.assertEqual(audit[1], "record_ownership_unverified_activity")
+        self.assertEqual(audit[2]["phase"], "expiry")
+        self.assertEqual(audit[2]["lifecycle_id"], context.instance_id)
+
+        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+            generator.send({"status": "ownership_unverified_recorded"})
+
+        scheduled = [name for name, _, _ in context.activity_calls]
+        self.assertNotIn("revoke_group_membership_activity", scheduled)
+        self.assertNotIn("release", [op for _, op, _ in context.entity_calls])
+        self.assertEqual(context.custom_statuses[-1]["status"], "ownership_unverified")
 
     def test_concurrent_admin_claim_is_rejected_before_preflight(self):
         context = FakeOrchestrationContext(self._admin_input())

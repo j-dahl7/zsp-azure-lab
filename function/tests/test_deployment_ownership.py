@@ -151,6 +151,14 @@ class ZspStaticSafetyTests(unittest.TestCase):
         for sensitive_path in ("local.settings.json", ".venv/", "venv/", "tests/", "*.pem", "*.key"):
             self.assertIn(sensitive_path, ignored)
 
+    def test_deployed_audit_table_and_dcr_include_exact_correlation_columns(self) -> None:
+        deploy = DEPLOY_LAB.read_text(encoding="utf-8-sig")
+
+        # Each column appears once in the Log Analytics table schema and once in
+        # the DCR stream declaration. Updating only one side breaks ingestion.
+        self.assertEqual(deploy.count('@{ name = "LifecycleId"; type = "string" }'), 2)
+        self.assertEqual(deploy.count('@{ name = "EntitlementId"; type = "string" }'), 2)
+
 
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is required")
 class ZspStandingPrivilegeCoverageTests(unittest.TestCase):
@@ -159,6 +167,7 @@ class ZspStandingPrivilegeCoverageTests(unittest.TestCase):
     def test_readme_documents_the_ownership_lost_recovery_runbook(self) -> None:
         readme = (LAB_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("ownership_lost", readme)
+        self.assertIn("ownership_unverified", readme)
         self.assertIn("Admin Lifecycle Ownership and Recovery", readme)
         self.assertIn("Recovery runbook:", readme)
         self.assertIn("only after", readme)
@@ -173,9 +182,11 @@ class ZspStandingPrivilegeCoverageTests(unittest.TestCase):
     def test_orchestrator_audits_before_failing_on_ownership_loss(self) -> None:
         source = (LAB_ROOT / "function" / "function_app.py").read_text(encoding="utf-8")
         self.assertIn("record_ownership_lost_activity", source)
-        # Both refusal sites must audit: mid-grant compensation and expiry.
-        self.assertEqual(source.count('"phase": "compensation"'), 1)
-        self.assertEqual(source.count('"phase": "expiry"'), 1)
+        self.assertIn("record_ownership_unverified_activity", source)
+        # Each phase audits both a confirmed owner mismatch and an exception
+        # that made ownership impossible to verify.
+        self.assertEqual(source.count('"phase": "compensation"'), 2)
+        self.assertEqual(source.count('"phase": "expiry"'), 2)
         # The audit must be emitted before the raise, never instead of it.
         for phase in ("compensation", "expiry"):
             marker = f'"phase": "{phase}"'

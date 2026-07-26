@@ -7,12 +7,55 @@ Sends all access grant/revoke events to Log Analytics custom table.
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Iterable, Mapping
+from urllib.parse import urlparse
+
 from azure.identity import DefaultAzureCredential
 from azure.monitor.ingestion import LogsIngestionClient
 
 
 class AuditWriteError(RuntimeError):
     """The access event could not be written to ZSPAudit_CL."""
+
+
+class AuditConfigurationError(AuditWriteError):
+    """Audit ingestion is not configured safely enough to permit a grant."""
+
+
+def audit_configuration_status() -> dict:
+    """Return a non-secret readiness assessment for the audit ingestion path."""
+
+    endpoint = os.environ.get("DCR_ENDPOINT", "").strip()
+    rule_id = os.environ.get("DCR_RULE_ID", "").strip()
+    issues = []
+
+    if not endpoint:
+        issues.append("DCR_ENDPOINT is missing")
+    else:
+        parsed = urlparse(endpoint)
+        if parsed.scheme.casefold() != "https" or not parsed.netloc:
+            issues.append("DCR_ENDPOINT must be an HTTPS URL")
+
+    if not rule_id:
+        issues.append("DCR_RULE_ID is missing")
+    elif not rule_id.casefold().startswith("dcr-"):
+        issues.append("DCR_RULE_ID must be an immutable dcr- ID")
+
+    return {
+        "ready": not issues,
+        "issues": issues,
+        "endpoint": endpoint,
+        "rule_id": rule_id,
+    }
+
+
+def require_audit_configuration() -> tuple[str, str]:
+    """Return the DCR settings or fail closed before privilege is granted."""
+
+    status = audit_configuration_status()
+    if not status["ready"]:
+        raise AuditConfigurationError("; ".join(status["issues"]))
+    return status["endpoint"], status["rule_id"]
 
 
 async def log_access_event(
@@ -27,6 +70,8 @@ async def log_access_event(
     justification: str | None = None,
     ticket_id: str | None = None,
     workflow_id: str | None = None,
+    lifecycle_id: str | None = None,
+    entitlement_id: str | None = None,
     expires_at: str | None = None,
     requested_by: str | None = None,
     error_message: str | None = None
@@ -46,17 +91,14 @@ async def log_access_event(
         justification: Reason for access (for human)
         ticket_id: ITSM ticket reference
         workflow_id: Workflow identifier (for NHI)
+        lifecycle_id: Durable orchestration instance that owns the event
+        entitlement_id: Exact group-membership or role-assignment identifier
         expires_at: Expiry timestamp
         requested_by: Who requested the access
         error_message: Error details if failed
     """
 
-    dcr_endpoint = os.environ.get("DCR_ENDPOINT")
-    dcr_rule_id = os.environ.get("DCR_RULE_ID")
-
-    if not dcr_endpoint or not dcr_rule_id:
-        logging.warning("DCR not configured, skipping audit log")
-        return
+    dcr_endpoint, dcr_rule_id = require_audit_configuration()
 
     try:
         credential = DefaultAzureCredential()
@@ -78,6 +120,8 @@ async def log_access_event(
             "Justification": justification or "",
             "TicketId": ticket_id or "",
             "WorkflowId": workflow_id or "",
+            "LifecycleId": lifecycle_id or "",
+            "EntitlementId": entitlement_id or "",
             "ExpiresAt": expires_at or "",
             "RequestedBy": requested_by or "",
             "Result": result,
@@ -107,7 +151,7 @@ def build_kql_query_all_grants(hours: int = 24) -> str:
 ZSPAudit_CL
 | where TimeGenerated > ago({hours}h)
 | where EventType == "AccessGrant"
-| project TimeGenerated, IdentityType, PrincipalId, Target, Role, DurationMinutes, Justification, WorkflowId, Result
+| project TimeGenerated, IdentityType, PrincipalId, Target, Role, DurationMinutes, Justification, WorkflowId, LifecycleId, EntitlementId, Result
 | order by TimeGenerated desc
 """
 
@@ -117,7 +161,7 @@ def build_kql_query_failures() -> str:
     return """
 ZSPAudit_CL
 | where Result == "Failed"
-| project TimeGenerated, EventType, IdentityType, PrincipalId, Target, ErrorMessage
+| project TimeGenerated, EventType, IdentityType, PrincipalId, Target, LifecycleId, EntitlementId, ErrorMessage
 | order by TimeGenerated desc
 """
 
@@ -129,7 +173,7 @@ ZSPAudit_CL
 | where IdentityType == "nhi"
 | where EventType == "AccessGrant"
 | where WorkflowId !in ("nightly-backup", "manual-test")
-| project TimeGenerated, PrincipalId, Target, Role, WorkflowId
+| project TimeGenerated, PrincipalId, Target, Role, WorkflowId, LifecycleId, EntitlementId
 | order by TimeGenerated desc
 """
 
@@ -141,7 +185,7 @@ ZSPAudit_CL
 | where IdentityType == "human"
 | where EventType == "AccessGrant"
 | where isempty(TicketId)
-| project TimeGenerated, PrincipalId, Target, Justification
+| project TimeGenerated, PrincipalId, Target, Justification, LifecycleId, EntitlementId
 | order by TimeGenerated desc
 """
 
@@ -162,27 +206,125 @@ def build_kql_query_unrevoked_expired_grants(grace_minutes: int = 15) -> str:
 
     return f"""
 let grace = {grace_minutes}m;
-let grants =
+let exact_grants =
     ZSPAudit_CL
     | where EventType == "AccessGrant" and Result == "Success"
     | where isnotempty(ExpiresAt)
     | extend Expiry = todatetime(ExpiresAt)
-    | project GrantTime = TimeGenerated, PrincipalId, Target, Role, IdentityType, Expiry;
-let revokes =
+    | where Expiry < ago(grace)
+    | where isnotempty(LifecycleId) and isnotempty(EntitlementId)
+    | summarize
+        GrantTime = min(TimeGenerated),
+        LastExpiry = max(Expiry),
+        PrincipalId = take_any(PrincipalId),
+        Target = take_any(Target),
+        Role = take_any(Role),
+        IdentityType = take_any(IdentityType)
+      by LifecycleId, EntitlementId;
+let exact_revokes =
     ZSPAudit_CL
     | where EventType == "AccessRevoke" and Result == "Success"
-    | project RevokeTime = TimeGenerated, PrincipalId, Target;
-grants
-| where Expiry < ago(grace)
-| join kind=leftouter revokes on PrincipalId, Target
-| where isnull(RevokeTime) or RevokeTime < GrantTime
-| summarize
-    Grants = count(),
-    LastGrant = max(GrantTime),
-    LastExpiry = max(Expiry)
-  by PrincipalId, Target, Role, IdentityType
-| extend
+    | where isnotempty(LifecycleId) and isnotempty(EntitlementId)
+    | summarize RevokeTime = max(TimeGenerated) by LifecycleId, EntitlementId;
+let exact_findings =
+    exact_grants
+    | join kind=leftanti exact_revokes on LifecycleId, EntitlementId
+    | extend
+        MinutesOverdue = datetime_diff('minute', now(), LastExpiry),
+        CorrelationStatus = "Exact",
+        Finding = "Expired lifecycle entitlement with no successful revoke";
+let legacy_findings =
+    ZSPAudit_CL
+    | where EventType == "AccessGrant" and Result == "Success"
+    | where isnotempty(ExpiresAt)
+    | extend LastExpiry = todatetime(ExpiresAt)
+    | where LastExpiry < ago(grace)
+    | where isempty(LifecycleId) or isempty(EntitlementId)
+    | project
+        GrantTime = TimeGenerated,
+        LastExpiry,
+        PrincipalId,
+        Target,
+        Role,
+        IdentityType,
+        LifecycleId,
+        EntitlementId
+    | extend
+        MinutesOverdue = datetime_diff('minute', now(), LastExpiry),
+        CorrelationStatus = "LegacyUncorrelated",
+        Finding = "Legacy expired grant lacks exact lifecycle correlation; review manually";
+union exact_findings, legacy_findings
+| project
+    GrantTime,
+    LastExpiry,
+    PrincipalId,
+    Target,
+    Role,
+    IdentityType,
+    LifecycleId,
+    EntitlementId,
     MinutesOverdue = datetime_diff('minute', now(), LastExpiry),
-    Finding = "Expired grant with no successful revoke"
+    CorrelationStatus,
+    Finding
 | order by MinutesOverdue desc
 """
+
+
+def evaluate_unrevoked_expired_grants(
+    events: Iterable[Mapping[str, object]],
+    *,
+    now: datetime,
+    grace_minutes: int = 15,
+) -> list[dict]:
+    """Evaluate the hunt's exact-correlation semantics without a Kusto service.
+
+    This reference implementation supports regression tests and offline incident
+    tooling. Legacy events are surfaced as uncorrelated review items; they are
+    never guessed against another lifecycle using principal and target fields.
+    """
+
+    if not isinstance(grace_minutes, int) or isinstance(grace_minutes, bool) or grace_minutes < 1:
+        raise ValueError("grace_minutes must be a positive integer")
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+
+    events = list(events)
+    cutoff = now.timestamp() - (grace_minutes * 60)
+    exact_revocations = {
+        (str(event.get("LifecycleId", "")), str(event.get("EntitlementId", "")))
+        for event in events
+        if event.get("EventType") == "AccessRevoke"
+        and event.get("Result") == "Success"
+        and event.get("LifecycleId")
+        and event.get("EntitlementId")
+    }
+
+    findings: dict[tuple[str, str], dict] = {}
+    legacy_findings = []
+    for event in events:
+        if event.get("EventType") != "AccessGrant" or event.get("Result") != "Success":
+            continue
+        expires_at = event.get("ExpiresAt")
+        if not isinstance(expires_at, str) or not expires_at:
+            continue
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if expiry.tzinfo is None or expiry.timestamp() >= cutoff:
+            continue
+
+        lifecycle_id = str(event.get("LifecycleId", ""))
+        entitlement_id = str(event.get("EntitlementId", ""))
+        finding = dict(event)
+        if not lifecycle_id or not entitlement_id:
+            finding["CorrelationStatus"] = "LegacyUncorrelated"
+            legacy_findings.append(finding)
+            continue
+
+        key = (lifecycle_id, entitlement_id)
+        if key not in exact_revocations:
+            finding["CorrelationStatus"] = "Exact"
+            findings[key] = finding
+
+    return [*findings.values(), *legacy_findings]

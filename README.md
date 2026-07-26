@@ -255,6 +255,19 @@ service without a stronger caller-identity layer.
 - **Log Analytics** - Custom `ZSPAudit_CL` table for audit trail
 - **Data Collection Endpoint/Rule** - Ingests audit events from the Function
 
+Every new grant, revoke, and ownership-guard failure includes two exact
+correlation fields:
+
+- `LifecycleId` is the Durable orchestration instance ID.
+- `EntitlementId` is the deterministic admin membership ownership key or the
+  full deterministic Azure role-assignment resource ID.
+
+`/api/health` is also a readiness signal for this audit dependency. Missing or
+malformed `DCR_ENDPOINT`/`DCR_RULE_ID` settings return HTTP 503 with
+`status: degraded`. Both request admission and each grant activity check the
+same configuration before any privilege side effect, so a stale Durable
+instance cannot bypass the gate after an app-setting change.
+
 ---
 
 ## File Structure
@@ -315,13 +328,14 @@ IDs. Requests outside those allowlists are rejected.
 A Durable Entity serializes ownership of each user/group membership. Only the
 lifecycle that claimed that entity may revoke the membership it created.
 
-If the entity can no longer prove ownership, the orchestrator sets
-`customStatus.status` to `ownership_lost`, records a `Result == "Failed"`
-`AccessRevoke` row in `ZSPAudit_CL`, and fails **without deleting the
-membership**. That refusal is deliberate: Graph membership edges carry no owner
-token, so a blind delete could remove a newer or independently managed
-entitlement. The cost is that temporary privilege can remain live, so this state
-requires manual recovery.
+If the entity confirms a different owner, the orchestrator sets
+`customStatus.status` to `ownership_lost`. If the ownership lookup itself throws,
+it sets `customStatus.status` to `ownership_unverified`. Both paths attempt a
+correlated `Result == "Failed"` `AccessRevoke` row in `ZSPAudit_CL`, retain the
+owner lock, and fail **without deleting the membership**. That refusal is
+deliberate: Graph membership edges carry no owner token, so a blind delete could
+remove a newer or independently managed entitlement. The cost is that temporary
+privilege can remain live, so either state requires manual recovery.
 
 Recovery runbook:
 
@@ -340,35 +354,64 @@ memberships manually while a lifecycle is active.
 
 `build_kql_query_unrevoked_expired_grants()` in `function/audit.py` returns the
 hunt for the failure this design can produce: a grant that is past its expiry
-with no matching successful `AccessRevoke`. Run it on a schedule and alert on any
-result, because every row is an entitlement that outlived its deadline.
+with no successful `AccessRevoke` for that exact `LifecycleId` and
+`EntitlementId`. It never guesses using principal and target, because repeated
+admin lifecycles and multiple NHI roles on one scope make that heuristic both
+false-positive and false-negative prone.
 
 ```kusto
 let grace = 15m;
-let grants =
+let exact_grants =
     ZSPAudit_CL
     | where EventType == "AccessGrant" and Result == "Success"
     | where isnotempty(ExpiresAt)
     | extend Expiry = todatetime(ExpiresAt)
-    | project GrantTime = TimeGenerated, PrincipalId, Target, Role, IdentityType, Expiry;
-let revokes =
+    | where Expiry < ago(grace)
+    | where isnotempty(LifecycleId) and isnotempty(EntitlementId)
+    | summarize
+        GrantTime = min(TimeGenerated),
+        LastExpiry = max(Expiry),
+        PrincipalId = take_any(PrincipalId),
+        Target = take_any(Target),
+        Role = take_any(Role),
+        IdentityType = take_any(IdentityType)
+      by LifecycleId, EntitlementId;
+let exact_revokes =
     ZSPAudit_CL
     | where EventType == "AccessRevoke" and Result == "Success"
-    | project RevokeTime = TimeGenerated, PrincipalId, Target;
-grants
-| where Expiry < ago(grace)
-| join kind=leftouter revokes on PrincipalId, Target
-| where isnull(RevokeTime) or RevokeTime < GrantTime
-| summarize Grants = count(), LastGrant = max(GrantTime), LastExpiry = max(Expiry)
-  by PrincipalId, Target, Role, IdentityType
-| extend MinutesOverdue = datetime_diff('minute', now(), LastExpiry)
+    | where isnotempty(LifecycleId) and isnotempty(EntitlementId)
+    | summarize RevokeTime = max(TimeGenerated) by LifecycleId, EntitlementId;
+let exact_findings =
+    exact_grants
+    | join kind=leftanti exact_revokes on LifecycleId, EntitlementId
+    | extend
+        MinutesOverdue = datetime_diff('minute', now(), LastExpiry),
+        CorrelationStatus = "Exact",
+        Finding = "Expired lifecycle entitlement with no successful revoke";
+let legacy_findings =
+    ZSPAudit_CL
+    | where EventType == "AccessGrant" and Result == "Success"
+    | where isnotempty(ExpiresAt)
+    | extend LastExpiry = todatetime(ExpiresAt)
+    | where LastExpiry < ago(grace)
+    | where isempty(LifecycleId) or isempty(EntitlementId)
+    | project GrantTime = TimeGenerated, LastExpiry, PrincipalId, Target, Role,
+              IdentityType, LifecycleId, EntitlementId
+    | extend
+        MinutesOverdue = datetime_diff('minute', now(), LastExpiry),
+        CorrelationStatus = "LegacyUncorrelated",
+        Finding = "Legacy expired grant lacks exact lifecycle correlation; review manually";
+union exact_findings, legacy_findings
 | order by MinutesOverdue desc
 ```
 
 Recommended alert: a Sentinel scheduled analytics rule running this query every
-15 minutes over a 24-hour lookback, severity High, with any result creating an
-incident. Pair it with an alert on `customStatus.status == "ownership_lost"` if
-you forward Durable instance telemetry.
+15 minutes, severity High, with `CorrelationStatus == "Exact"` creating an
+incident. Route `LegacyUncorrelated` rows to a separate manual-review queue; they
+are intentionally not labeled as confirmed unrevoked grants because old rows do
+not contain a safe join key. Pair this with alerts on
+`customStatus.status in ("ownership_lost", "ownership_unverified")` and failed
+audit rows whose `ErrorMessage` begins with either state name.
 
 ---
 
