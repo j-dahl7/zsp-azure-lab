@@ -157,9 +157,9 @@ azure-functions==1.24.0 \
     # via
     #   -r function/requirements.in
     #   azure-functions-durable
-azure-functions-durable==1.6.0 \
-    --hash=sha256:30feb3968aed71fc481e62b88fbaea5c89e9e8dacd703e0a1d5b86aa12ad8c92 \
-    --hash=sha256:7f28545d7025c10476c0d0ba33b90969476af76115f8d4862827db941b546760
+azure-functions-durable==1.7.0 \
+    --hash=sha256:0c492d4dc6ce4099d618afd59db6e96e50b2edd8e4e8ad05faf4e24090fc8d09 \
+    --hash=sha256:8ba754a44fa57fbb2c314d48fea38a3cf4b43919ff2f6df42ef42b7c8f4a8d52
     # via -r function/requirements.in
 azure-identity==1.25.3 \
     --hash=sha256:ab23c0d63015f50b630ef6c6cf395e7262f439ce06e5d07a64e874c724f8d9e6 \
