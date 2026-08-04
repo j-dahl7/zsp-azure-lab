@@ -164,6 +164,19 @@ else {
 }
 
 # Grant RoleManagement.ReadWrite.Directory (required for role-assignable group membership)
+#
+# Trade-off, stated plainly: this is standing, tenant-wide privilege, and it is the
+# one piece of standing privilege this lab does not eliminate. Graph requires it to
+# change the membership of a role-assignable group - GroupMember.ReadWrite.All is
+# not sufficient - so the gateway cannot do its job without it.
+#
+# What it means: this permission can assign any directory role, including Global
+# Administrator. The lab moves standing privilege off *people* and into *one
+# audited workload*; it does not make it disappear. Treat the Function App as a
+# Tier 0 asset - its identity is as powerful as a standing Global Admin.
+#
+# In production, prefer PIM for Groups or Entra Entitlement Management, which
+# provide the same just-in-time membership without a standing grant of this scope.
 Write-Host "  Granting RoleManagement.ReadWrite.Directory..." -ForegroundColor Cyan
 $hasRoleMgmtPerm = $existingGroupPerm.value | Where-Object { $_.appRoleId -eq $RoleManagementReadWriteDirectoryId }
 

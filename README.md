@@ -44,6 +44,35 @@ The gateway:
 
 ---
 
+## What This Does Not Eliminate
+
+The gateway itself holds standing, tenant-wide `RoleManagement.ReadWrite.Directory`.
+That is not an oversight, and it is worth being direct about it in a lab whose whole
+subject is removing standing privilege.
+
+**Why it cannot be removed.** Microsoft Graph requires `RoleManagement.ReadWrite.Directory`
+to change the membership of a role-assignable group. The narrower
+`GroupMember.ReadWrite.All` is not sufficient for those groups. Since group-based
+elevation is how the gateway grants Entra roles, the permission is a hard requirement.
+
+**What it actually confers.** This permission can assign *any* directory role,
+including Global Administrator. It is not scoped to the roles this lab manages.
+
+**So what the lab really does.** It moves standing privilege off *people* and into
+*one audited workload*. That is a genuine improvement — a single identity with
+logging, alerting, and a controlled deployment surface is easier to monitor than a
+dozen humans with permanent role assignments — but it is a relocation, not an
+elimination. **Treat the Function App as a Tier 0 asset.** Anyone who can deploy code
+to it, or steal its managed identity token, holds Global Administrator.
+
+**Production alternatives.** [PIM for Groups](https://learn.microsoft.com/en-us/entra/id-governance/privileged-identity-management/concept-pim-for-groups)
+and [Entra Entitlement Management](https://learn.microsoft.com/en-us/entra/id-governance/entitlement-management-overview)
+deliver the same just-in-time group membership without granting this permission to a
+workload you operate yourself. If you are solving this problem for real rather than
+learning how it works, start there.
+
+---
+
 ## Use Cases
 
 | Identity Type | Example | Access Pattern |
