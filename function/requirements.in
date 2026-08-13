@@ -1,8 +1,8 @@
 # Direct Azure Functions dependencies. Regenerate pins.txt for Python 3.11.
-azure-functions>=1.24.0,<2.0.0
-azure-functions-durable>=1.6.0
+azure-functions>=1.25.0,<2.0.0
+azure-functions-durable>=1.7.0
 azure-identity>=1.25.3
-msgraph-sdk>=1.60.0
+msgraph-sdk>=1.61.0
 azure-mgmt-authorization>=4.0.0
 azure-monitor-ingestion>=1.1.0
 python-dateutil>=2.9.0.post0
