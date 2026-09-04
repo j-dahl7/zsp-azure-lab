@@ -233,6 +233,21 @@ Core Tools follows `function/.funcignore`; the zip fallback builds an explicit
 allowlist containing only reviewed runtime modules, `host.json`, and the two
 dependency manifest files.
 
+### Runtime dependency evidence
+
+`function/requirements.txt` remains the hash-enforced entry point for the
+resolved versions in `function/pins.txt`. The existing h2 pin is 4.4.1, which
+includes the duplicate-Host-header fix; do not replace the entry point with an
+unhashed package list to make dependency metadata appear current.
+
+CI records the actual hash-verified pip installation, checks installed versions
+and imports h2, then prepares a bounded dependency snapshot. After a successful
+`main` push, a separate job uses GitHub's official dependency submission API to
+refresh the `function/requirements.txt` graph from that evidence. Pull requests
+only validate and prepare evidence; they cannot submit it. The validation job
+has read-only permissions, and only the submission job receives `contents: write`.
+See [GitHub dependency submission](https://docs.github.com/en/rest/dependency-graph/dependency-submission).
+
 ### 3. Test NHI Access
 
 Request temporary Key Vault access for a service principal:
