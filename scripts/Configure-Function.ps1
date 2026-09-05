@@ -41,6 +41,9 @@
 .PARAMETER DcrEndpoint
     Data Collection Endpoint URL.
 
+.PARAMETER DceResourceId
+    Exact deployed Data Collection Endpoint ARM resource ID for endpoint verification.
+
 .PARAMETER DcrRuleId
     Data Collection Rule immutable ID (dcr-...).
 
@@ -87,6 +90,9 @@ param(
     [string]$DcrEndpoint,
 
     [Parameter(Mandatory)]
+    [string]$DceResourceId,
+
+    [Parameter(Mandatory)]
     [string]$DcrRuleId,
 
     [Parameter(Mandatory)]
@@ -100,6 +106,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
+. "$PSScriptRoot/Credential-Destinations.ps1"
+$DcrEndpoint = Get-VerifiedIngestionEndpoint -Endpoint $DcrEndpoint `
+    -DceResourceId $DceResourceId -ResourceGroupName $ResourceGroupName -RuleId $DcrRuleId
 
 Write-Host "Configuring Function App settings..." -ForegroundColor Yellow
 

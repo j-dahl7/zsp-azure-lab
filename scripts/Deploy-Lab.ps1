@@ -22,6 +22,10 @@
 .PARAMETER MaxAccessDurationMinutes
     Maximum duration for any access grant. Default: 480 (8 hours)
 
+.PARAMETER ConfirmLifecycleMigration
+    Acknowledge verified fresh task hub or completed legacy drain, exact entitlement
+    reconciliation, and prior Durable key rotation. This switch performs none of those steps.
+
 .PARAMETER SkipFunctionDeploy
     Skip deploying Function App code (useful for re-running after code changes)
 
@@ -43,15 +47,15 @@
     Existing backup service principal object ID.
 
 .EXAMPLE
-    ./Deploy-Lab.ps1
+    ./Deploy-Lab.ps1 -ConfirmLifecycleMigration
     Deploys with default settings (zsp-lab in eastus)
 
 .EXAMPLE
-    ./Deploy-Lab.ps1 -ProjectName "my-zsp" -Location "westus2"
+    ./Deploy-Lab.ps1 -ConfirmLifecycleMigration -ProjectName "my-zsp" -Location "westus2"
     Deploys with custom project name and region
 
 .EXAMPLE
-    ./Deploy-Lab.ps1 -ProjectName "my-zsp" `
+    ./Deploy-Lab.ps1 -ConfirmLifecycleMigration -ProjectName "my-zsp" `
       -ExpectedIntuneAdminGroupId "<OBJECT_ID>" `
       -ExpectedSecurityReaderGroupId "<OBJECT_ID>" `
       -ExpectedBackupAppObjectId "<OBJECT_ID>" `
@@ -77,6 +81,9 @@ param(
     [switch]$SkipFunctionDeploy,
 
     [Parameter()]
+    [switch]$ConfirmLifecycleMigration,
+
+    [Parameter()]
     [switch]$SkipTest,
 
     [Parameter()]
@@ -100,6 +107,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# This gate precedes ALL changes, including settings that could alter old grants.
+if (-not $ConfirmLifecycleMigration) {
+    throw 'Before deployment, confirm a fresh app or completed legacy lifecycle drain, exact grant reconciliation, and rotation of previously exposed Durable extension keys. Read README lifecycle migration, then pass -ConfirmLifecycleMigration. This flag performs no drain or key rotation.'
+}
 $PSNativeCommandUseErrorActionPreference = $false
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
@@ -172,7 +183,7 @@ foreach ($line in $outputs) {
 # Validate critical deployment outputs
 $requiredKeys = @(
     'RESOURCE_GROUP_NAME', 'RESOURCE_GROUP_ID', 'FUNCTION_APP_NAME',
-    'FUNCTION_APP_URL', 'FUNCTION_APP_PRINCIPAL_ID', 'KEYVAULT_ID',
+    'FUNCTION_APP_URL', 'FUNCTION_APP_ID', 'FUNCTION_APP_PRINCIPAL_ID', 'KEYVAULT_ID',
     'KEYVAULT_NAME', 'STORAGE_ACCOUNT_ID', 'STORAGE_ACCOUNT_NAME',
     'LOG_ANALYTICS_WORKSPACE_ID', 'LOG_ANALYTICS_WORKSPACE_CUSTOMER_ID',
     'SUBSCRIPTION_ID', 'TENANT_ID', 'DCR_ENDPOINT_URL', 'DEPLOYMENT_ID',
@@ -471,6 +482,7 @@ Write-Host "Step 5/7: Configuring Function App..." -ForegroundColor Cyan
     -StorageResourceId $config['STORAGE_ACCOUNT_ID'] `
     -LogAnalyticsWorkspaceId $config['LOG_ANALYTICS_WORKSPACE_CUSTOMER_ID'] `
     -DcrEndpoint $config['DCR_ENDPOINT_URL'] `
+    -DceResourceId $dceId `
     -DcrRuleId $config['DCR_RULE_ID'] `
     -MaxAccessDurationMinutes $MaxAccessDurationMinutes
 
@@ -531,7 +543,7 @@ if (-not $SkipFunctionDeploy) {
             # settings, virtual environments, tests, caches, or arbitrary files.
             $deploymentFiles = @(
                 'access_safety.py', 'admin_access.py', 'audit.py',
-                'function_app.py', 'nhi_access.py', 'host.json',
+                'function_app.py', 'nhi_access.py', 'security_boundaries.py', 'host.json',
                 'requirements.txt', 'pins.txt'
             )
             try {
@@ -593,6 +605,8 @@ if (-not $SkipTest) {
 
     & "$ScriptDir/Test-Lab.ps1" `
         -FunctionAppUrl $config['FUNCTION_APP_URL'] `
+        -FunctionAppResourceId $config['FUNCTION_APP_ID'] `
+        -ManifestPath $ManifestPath `
         -FunctionKey $functionKey `
         -BackupSpObjectId $config['BACKUP_SP_OBJECT_ID'] `
         -KeyVaultResourceId $config['KEYVAULT_ID'] `

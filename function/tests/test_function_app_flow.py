@@ -30,10 +30,11 @@ azure_module.durable_functions = durable_module
 
 
 class HttpResponse:
-    def __init__(self, body, *, status_code=200, mimetype=None):
+    def __init__(self, body, *, status_code=200, mimetype=None, headers=None):
         self.body = body
         self.status_code = status_code
         self.mimetype = mimetype
+        self.headers = headers or {}
 
     def get_body(self):
         return self.body.encode("utf-8")
@@ -134,8 +135,12 @@ OTHER_SCOPE = (
 
 
 class FakeRequest:
-    def __init__(self, body):
+    def __init__(self, body, *, instance_id="instance-123", headers=None, params=None):
         self.body = body
+        self.url = "https://zsp-test.azurewebsites.net/api/nhi-access"
+        self.route_params = {"instance_id": instance_id}
+        self.headers = {"x-functions-key": "test-key"} if headers is None else headers
+        self.params = params or {}
 
     def get_json(self):
         return self.body
@@ -154,19 +159,20 @@ class FakeDurableClient:
         return self.instance_id
 
     def create_check_status_response(self, _request, instance_id):
-        return HttpResponse(
-            json.dumps(
-                {
-                    "id": instance_id,
-                    "statusQueryGetUri": f"https://status.example/{instance_id}",
-                }
-            ),
-            status_code=202,
-            mimetype="application/json",
-        )
+        raise AssertionError("Durable management responses must never reach clients")
 
 
 class EndpointSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        env = patch.dict(os.environ, {
+            'WEBSITE_HOSTNAME': 'zsp-test.azurewebsites.net',
+            'ALLOWED_ADMIN_USER_IDS': USER_ID, 'ALLOWED_ADMIN_GROUP_IDS': GROUP_ID,
+            'ALLOWED_NHI_SP_OBJECT_IDS': SP_ID, 'ALLOWED_SCOPE_IDS': SCOPE,
+            'MAX_ACCESS_DURATION_MINUTES': '480',
+        })
+        env.start()
+        self.addCleanup(env.stop)
+
     async def test_admin_endpoint_starts_history_before_any_grant(self):
         grant = AsyncMock()
         client = FakeDurableClient()
@@ -195,11 +201,11 @@ class EndpointSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.status_code, 202)
-        self.assertEqual(client.calls[0][0], "access_lifecycle_orchestrator")
+        self.assertEqual(client.calls[0][0], function_app.LIFECYCLE_ORCHESTRATOR)
         self.assertEqual(client.calls[0][1]["access_type"], "admin")
         grant.assert_not_awaited()
 
-    async def test_durable_start_failure_cannot_leave_nhi_privilege(self):
+    async def test_durable_start_failure_does_not_grant_inline_or_claim_confirmed_absence(self):
         grant = AsyncMock()
         client = FakeDurableClient(error=RuntimeError("durable storage unavailable"))
         with (
@@ -228,7 +234,7 @@ class EndpointSafetyTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.status_code, 503)
-        self.assertIn("no access was granted", json.loads(response.body)["error"])
+        self.assertIn("outcome could not be confirmed", json.loads(response.body)["error"])
         grant.assert_not_awaited()
 
     async def test_boolean_duration_is_rejected_before_orchestration(self):
@@ -270,7 +276,7 @@ class EndpointSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.calls), 1)
         name, payload = client.calls[0]
-        self.assertEqual(name, "access_lifecycle_orchestrator")
+        self.assertEqual(name, function_app.LIFECYCLE_ORCHESTRATOR)
         self.assertEqual(payload["access_type"], "nhi_bundle")
         self.assertEqual(len(payload["grants"]), 2)
         grant.assert_not_awaited()
@@ -358,6 +364,16 @@ class EndpointSafetyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EndpointAllowlistTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        env = patch.dict(os.environ, {
+            'WEBSITE_HOSTNAME': 'zsp-test.azurewebsites.net',
+            'ALLOWED_ADMIN_USER_IDS': USER_ID, 'ALLOWED_ADMIN_GROUP_IDS': GROUP_ID,
+            'ALLOWED_NHI_SP_OBJECT_IDS': SP_ID, 'ALLOWED_SCOPE_IDS': SCOPE,
+            'MAX_ACCESS_DURATION_MINUTES': '480',
+        })
+        env.start()
+        self.addCleanup(env.stop)
+
     """Cover the deny and unconfigured branches of both admission paths.
 
     Every environment here is patched with clear=True so an allowlist the machine
@@ -515,6 +531,7 @@ class EndpointAllowlistTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_allows_an_allowlist_written_in_upper_case(self):
         response, client = await self._admin_request(
             {
+                "WEBSITE_HOSTNAME": "zsp-test.azurewebsites.net",
                 "ALLOWED_ADMIN_GROUP_IDS": GROUP_ID.upper(),
                 "ALLOWED_ADMIN_USER_IDS": USER_ID.upper(),
             },
@@ -633,6 +650,16 @@ class AdminOwnershipEntityTests(unittest.TestCase):
 
 
 class ActivityFailureAuditTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        env = patch.dict(os.environ, {
+            'WEBSITE_HOSTNAME': 'zsp-test.azurewebsites.net',
+            'ALLOWED_ADMIN_USER_IDS': USER_ID, 'ALLOWED_ADMIN_GROUP_IDS': GROUP_ID,
+            'ALLOWED_NHI_SP_OBJECT_IDS': SP_ID, 'ALLOWED_SCOPE_IDS': SCOPE,
+            'MAX_ACCESS_DURATION_MINUTES': '480',
+        })
+        env.start()
+        self.addCleanup(env.stop)
+
     async def test_grant_activity_checks_audit_readiness_before_side_effect(self):
         grant = AsyncMock()
         with (
@@ -885,7 +912,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_lifecycle_preflights_then_grants_then_revokes(self):
         context = FakeOrchestrationContext(self._nhi_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         preflight_task = next(generator)
         self.assertEqual(preflight_task[1], "check_nhi_entitlement_activity")
@@ -933,7 +960,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_grant_failure_compensates_deterministic_entitlement(self):
         context = FakeOrchestrationContext(self._nhi_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         grant_task = generator.send({"status": "absent"})
@@ -947,7 +974,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_preexisting_entitlement_is_never_compensated(self):
         context = FakeOrchestrationContext(self._nhi_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         with self.assertRaises(PreexistingEntitlementError):
@@ -956,7 +983,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_admin_lifecycle_claims_verifies_and_releases_serialized_owner(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         claim = next(generator)
         self.assertEqual(claim[0:2], ("entity", "claim"))
@@ -984,7 +1011,7 @@ class OrchestratorTests(unittest.TestCase):
     def _run_admin_to_expiry_ownership_loss(self, context):
         """Drive an admin lifecycle to the expiry ownership-loss branch."""
 
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
         next(generator)
         generator.send({"claimed": True, "owner": context.instance_id})
         generator.send({"status": "absent"})
@@ -1035,7 +1062,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_compensation_ownership_loss_audits_with_its_own_phase(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         generator.send({"claimed": True, "owner": context.instance_id})
@@ -1055,7 +1082,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_compensation_verification_exception_is_audited_without_delete(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         generator.send({"claimed": True, "owner": context.instance_id})
@@ -1078,7 +1105,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_expiry_verification_exception_is_audited_without_delete(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         generator.send({"claimed": True, "owner": context.instance_id})
@@ -1102,7 +1129,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_concurrent_admin_claim_is_rejected_before_preflight(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         with self.assertRaises(PreexistingEntitlementError):
@@ -1112,7 +1139,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_admin_preflight_failure_releases_claim_without_revoking(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         generator.send({"claimed": True, "owner": context.instance_id})
@@ -1126,7 +1153,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_admin_grant_failure_verifies_compensates_then_releases(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         generator.send({"claimed": True, "owner": context.instance_id})
@@ -1145,7 +1172,7 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_admin_cleanup_failure_retains_owner_lock(self):
         context = FakeOrchestrationContext(self._admin_input())
-        generator = function_app.access_lifecycle_orchestrator(context)
+        generator = function_app._access_lifecycle_saga(context, context.get_input())
 
         next(generator)
         generator.send({"claimed": True, "owner": context.instance_id})
@@ -1165,7 +1192,7 @@ class OrchestratorTests(unittest.TestCase):
                 "expiry_time": "2026-07-10T13:00:00-05:00",
             }
         )
-        generator = function_app.revocation_orchestrator(context)
+        generator = function_app._legacy_revocation_orchestrator_for_review(context)
 
         self.assertEqual(next(generator)[0], "timer")
         self.assertEqual(
@@ -1175,6 +1202,122 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaises(StopIteration):
             generator.send(None)
 
+
+class PrivateLifecycleSecurityTests(unittest.IsolatedAsyncioTestCase):
+    setUp = EndpointSafetyTests.setUp
+    """Exercise direct Durable admission and the public projection without Azure."""
+
+    def nhi_input(self, **changes):
+        return {"api_version": 2, "access_type": "nhi", "sp_object_id": SP_ID,
+                "scope": SCOPE, "role": "Key Vault Secrets User", "duration_minutes": 2,
+                "workflow_id": "manual-test", **changes}
+
+    async def test_response_contains_no_reusable_durable_management_capabilities(self):
+        client = FakeDurableClient()
+        response = await function_app._start_access_lifecycle(FakeRequest({}), client, self.nhi_input())
+        body = json.loads(response.body)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(set(body), {"id", "status", "statusQueryGetUri"})
+        self.assertEqual(body["statusQueryGetUri"], "https://zsp-test.azurewebsites.net/api/access-status/instance-123")
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    async def test_direct_durable_start_cannot_bypass_policy(self):
+        for changes in ({"sp_object_id": OTHER_SP_ID}, {"scope": OTHER_SCOPE},
+                        {"role": "Owner"}, {"duration_minutes": 481},
+                        {"workflow_id": "anything"}, {"api_version": 1}):
+            with self.subTest(changes=changes):
+                context = FakeOrchestrationContext(self.nhi_input(**changes))
+                generator = function_app.access_lifecycle_orchestrator_v2(context)
+                first = next(generator)
+                self.assertEqual(first[1], "authorize_access_lifecycle_activity")
+                self.assertEqual(len(context.activity_calls), 1)
+                with self.assertRaises((PermissionError, ValueError)):
+                    await function_app.authorize_access_lifecycle_activity(first[2])
+                with self.assertRaises(PermissionError):
+                    generator.throw(PermissionError("denied"))
+                self.assertEqual(len(context.activity_calls), 1)
+
+    async def test_authorized_v2_history_advances_to_owned_saga_preflight(self):
+        context = FakeOrchestrationContext(self.nhi_input())
+        generator = function_app.access_lifecycle_orchestrator_v2(context)
+        authorization_task = next(generator)
+        admitted = await function_app.authorize_access_lifecycle_activity(authorization_task[2])
+        preflight = generator.send(admitted)
+        self.assertEqual(preflight[1], 'check_nhi_entitlement_activity')
+        self.assertEqual(preflight[2]['sp_object_id'], SP_ID)
+        self.assertEqual(preflight[2]['requested_by'], function_app.NHI_REQUEST_SOURCE)
+
+    async def test_grant_activities_recheck_policy_after_history_admission(self):
+        grant = AsyncMock()
+        with patch.object(function_app, "grant_nhi_access", grant):
+            with patch.dict(os.environ, {"ALLOWED_NHI_SP_OBJECT_IDS": OTHER_SP_ID}):
+                with self.assertRaises(PermissionError):
+                    await function_app.grant_nhi_access_activity(self.nhi_input())
+        grant.assert_not_awaited()
+        admin_grant = AsyncMock()
+        with patch.object(function_app, "grant_admin_access", admin_grant):
+            with self.assertRaises(PermissionError):
+                await function_app.grant_admin_access_activity({"user_id": OTHER_USER_ID,
+                    "group_id": GROUP_ID, "duration_minutes": 2, "justification": "Incident investigation"})
+        admin_grant.assert_not_awaited()
+
+    async def test_direct_authorization_normalizes_requester_and_discards_extra_fields(self):
+        admitted = await function_app.authorize_access_lifecycle_activity(
+            self.nhi_input(requested_by="administrator", secret="must disappear"))
+        self.assertEqual(admitted["requested_by"], function_app.NHI_REQUEST_SOURCE)
+        self.assertNotIn("secret", admitted)
+        self.assertNotIn("access_lifecycle_orchestrator", vars(function_app))
+        self.assertNotIn("revocation_orchestrator", vars(function_app))
+
+    async def test_status_projects_only_admitted_fields_and_exact_assignment(self):
+        instance_id = "instance-123"
+        assignment = build_nhi_assignment_id(SCOPE, build_nhi_assignment_name(instance_id, 0, SP_ID, SCOPE, "Key Vault Secrets User"))
+        record = {"name": function_app.LIFECYCLE_ORCHESTRATOR, "instanceId": instance_id,
+                  "runtimeStatus": "Running", "input": self.nhi_input(secret="input-secret"),
+                  "output": "output-secret", "history": ["history-secret"],
+                  "customStatus": {"status": "active", "expires_at": "2026-09-05T02:00:00+00:00",
+                    "error": "error-secret", "grants": [{"assignment_id": assignment, "secret": "grant-secret"},
+                                                           {"assignment_id": "https://external.example/?code=secret"}]}}
+        client = types.SimpleNamespace(get_status=AsyncMock(return_value=types.SimpleNamespace(to_json=lambda: record)))
+        response = await function_app.access_status(FakeRequest({}), client)
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        self.assertEqual(set(body), {"id", "runtimeStatus", "customStatus"})
+        self.assertEqual(body["customStatus"]["grants"], [{"assignment_id": assignment}])
+        self.assertNotIn("secret", response.body)
+        client.get_status.assert_awaited_once_with(instance_id, show_history=False, show_history_output=False, show_input=True)
+
+    async def test_status_rejects_query_keys_bad_ids_and_out_of_policy_histories(self):
+        client = types.SimpleNamespace(get_status=AsyncMock())
+        for request, expected in ((FakeRequest({}, headers={}), 401),
+                (FakeRequest({}, params={"code": "secret"}), 401),
+                (FakeRequest({}, instance_id="../other"), 400)):
+            response = await function_app.access_status(request, client)
+            self.assertEqual(response.status_code, expected)
+        client.get_status.assert_not_awaited()
+        for name, body in (("revocation_orchestrator", self.nhi_input()),
+                           (function_app.LIFECYCLE_ORCHESTRATOR, self.nhi_input(sp_object_id=OTHER_SP_ID))):
+            record = {"name": name, "instanceId": "instance-123", "runtimeStatus": "Running", "input": body}
+            client.get_status.return_value = types.SimpleNamespace(to_json=lambda: record)
+            response = await function_app.access_status(FakeRequest({}), client)
+            self.assertEqual(response.status_code, 403)
+        client.get_status.return_value = None
+        self.assertEqual((await function_app.access_status(FakeRequest({}), client)).status_code, 404)
+        client.get_status.side_effect = Exception("token-secret")
+        response = await function_app.access_status(FakeRequest({}), client)
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("token-secret", response.body)
+
+    async def test_full_backup_bundle_is_validated_before_any_grant(self):
+        storage = SCOPE.replace("Microsoft.KeyVault/vaults/example", "Microsoft.Storage/storageAccounts/example")
+        with patch.dict(os.environ, {"BACKUP_SP_OBJECT_ID": SP_ID, "KEYVAULT_RESOURCE_ID": SCOPE, "STORAGE_RESOURCE_ID": storage}):
+            bundle = {"api_version": 2, "access_type": "nhi_bundle", "duration_minutes": 2,
+                      "grants": [self.nhi_input(workflow_id="nightly-backup"), self.nhi_input(scope=storage, role="Storage Blob Data Contributor", workflow_id="nightly-backup")]}
+            admitted = await function_app.authorize_access_lifecycle_activity(bundle)
+            self.assertEqual(len(admitted["grants"]), 2)
+            bundle["grants"][1]["scope"] = OTHER_SCOPE
+            with self.assertRaises(PermissionError):
+                await function_app.authorize_access_lifecycle_activity(bundle)
 
 if __name__ == "__main__":
     unittest.main()
