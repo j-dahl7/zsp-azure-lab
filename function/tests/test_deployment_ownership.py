@@ -296,6 +296,8 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
                     print(json.dumps({"id": subscription, "tenantId": tenant, "name": "Mock Subscription"}))
                 elif args[:3] == ["ad", "signed-in-user", "show"]:
                     print("33333333-3333-4333-8333-333333333333")
+                elif args[:2] == ["resource", "show"]:
+                    print(json.dumps({"id": option("--ids"), "properties": {"defaultHostName": "zsp-lab-gw-mock.azurewebsites.net"}}))
                 elif args[:2] == ["group", "exists"]:
                     print("true" if state["rg_exists"] else "false")
                 elif args[:2] == ["group", "show"]:
@@ -336,6 +338,7 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
                         "resourceGroupId": value(rg_id),
                         "functionAppName": value(f"{project}-gw-{unique}"),
                         "functionAppUrl": value(f"https://{project}-gw-{unique}.azurewebsites.net"),
+                        "functionAppId": value(f"{rg_id}/providers/Microsoft.Web/sites/{project}-gw-{unique}"),
                         "functionAppPrincipalId": value("44444444-4444-4444-8444-444444444444"),
                         "keyVaultId": value(f"{rg_id}/providers/Microsoft.KeyVault/vaults/{project}-kv"),
                         "keyVaultName": value(f"{project}-kv"),
@@ -547,22 +550,31 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
             f"{key_vault_id}/providers/Microsoft.Authorization/"
             f"roleAssignments/{assignment_name}"
         )
+        self.manifest_path.write_text(json.dumps({
+            "schema_version": 2, "status": "validated", "azure_owner_marker": OWNER_MARKER,
+            "deployment_id": "66666666-6666-4666-8666-666666666666", "tenant_id": TENANT_ID,
+            "subscription_id": SUBSCRIPTION_ID, "resource_group_name": RESOURCE_GROUP,
+            "resource_group_id": RESOURCE_GROUP_ID, "project_name": PROJECT,
+            "provenance_marker": f"nine-lives-zsp:v1;tenant={TENANT_ID};project={PROJECT}",
+        }), encoding="utf-8")
+        self._write_state(rg_exists=True, owner=OWNER_MARKER, deployment="66666666-6666-4666-8666-666666666666")
         harness = self.root / "run-test-lab.ps1"
         harness.write_text(
             textwrap.dedent(
                 f'''
                 function global:Invoke-RestMethod {{
-                    param($Uri, $Method = 'GET', $Headers, $Body, $ContentType, $TimeoutSec)
+                    param($Uri, $Method = 'GET', $Headers, $Body, $ContentType, $TimeoutSec, $MaximumRedirection)
+                    if ($Headers['x-functions-key'] -cne 'test-key' -or $MaximumRedirection -ne 0) {{ throw 'Missing safe key transport contract' }}
                     if ($Uri -like '*/api/health') {{
                         return [pscustomobject]@{{ status = 'healthy' }}
                     }}
                     if ($Method -eq 'POST') {{
                         return [pscustomobject]@{{
                             id = 'mock-instance'
-                            statusQueryGetUri = 'https://status.example/mock-instance'
+                            statusQueryGetUri = 'https://zsp-lab-gw-mock.azurewebsites.net/api/access-status/mock-instance'
                         }}
                     }}
-                    if ($Uri -eq 'https://status.example/mock-instance') {{
+                    if ($Uri -eq 'https://zsp-lab-gw-mock.azurewebsites.net/api/access-status/mock-instance') {{
                         return [pscustomobject]@{{
                             runtimeStatus = 'Running'
                             customStatus = [pscustomobject]@{{
@@ -576,7 +588,9 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
                 }}
 
                 & '{TEST_LAB}' `
-                    -FunctionAppUrl 'https://zsp-lab.example' `
+                    -FunctionAppUrl 'https://zsp-lab-gw-mock.azurewebsites.net' `
+                    -FunctionAppResourceId '{RESOURCE_GROUP_ID}/providers/Microsoft.Web/sites/zsp-lab-gw-mock' `
+                    -ManifestPath '{self.manifest_path}' `
                     -FunctionKey 'test-key' `
                     -BackupSpObjectId '{DEPLOYER_ID}' `
                     -KeyVaultResourceId '{key_vault_id}' `
@@ -630,6 +644,7 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
                   'RESOURCE_GROUP_NAME={RESOURCE_GROUP}'
                   'RESOURCE_GROUP_ID={rg_id}'
                   'FUNCTION_APP_NAME=zsp-lab-gw-mock'
+                  'FUNCTION_APP_ID={rg_id}/providers/Microsoft.Web/sites/zsp-lab-gw-mock'
                   'FUNCTION_APP_URL=https://zsp-lab-gw-mock.azurewebsites.net'
                   'FUNCTION_APP_PRINCIPAL_ID=44444444-4444-4444-8444-444444444444'
                   'KEYVAULT_ID={rg_id}/providers/Microsoft.KeyVault/vaults/zsp-lab-kv'
@@ -672,11 +687,11 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
         (scripts / "Configure-Function.ps1").write_text(
-            "param($FunctionAppName,$ResourceGroupName,$IntuneAdminGroupId,$SecurityReaderGroupId,$BackupSpObjectId,$AllowedAdminUserIds,$KeyVaultResourceId,$StorageResourceId,$LogAnalyticsWorkspaceId,$DcrEndpoint,$DcrRuleId,$MaxAccessDurationMinutes)\nexit 0\n",
+            "param($FunctionAppName,$ResourceGroupName,$IntuneAdminGroupId,$SecurityReaderGroupId,$BackupSpObjectId,$AllowedAdminUserIds,$KeyVaultResourceId,$StorageResourceId,$LogAnalyticsWorkspaceId,$DcrEndpoint,$DceResourceId,$DcrRuleId,$MaxAccessDurationMinutes)\nexit 0\n",
             encoding="utf-8",
         )
         (scripts / "Test-Lab.ps1").write_text(
-            "param($FunctionAppUrl,$FunctionKey,$BackupSpObjectId,$KeyVaultResourceId,[switch]$WaitForRevocation)\nWrite-Host 'SMOKE FAILED'\nexit 9\n",
+            "param($FunctionAppUrl,$FunctionKey,$FunctionAppResourceId,$ManifestPath,$BackupSpObjectId,$KeyVaultResourceId,[switch]$WaitForRevocation)\nWrite-Host 'SMOKE FAILED'\nexit 9\n",
             encoding="utf-8",
         )
 
@@ -688,6 +703,7 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
             "-Location",
             "eastus",
             "-SkipFunctionDeploy",
+            "-ConfirmLifecycleMigration",
             "-ManifestPath",
             str(smoke_manifest),
         )

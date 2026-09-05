@@ -20,7 +20,13 @@
     Resource ID of the Key Vault for testing access grants.
 
 .PARAMETER FunctionKey
-    Function key for authenticating requests.
+    Ordinary Function key authorizing admission and status routes, sent in headers.
+
+.PARAMETER FunctionAppResourceId
+    Exact deployed Microsoft.Web/sites ARM resource ID, verified before sending a key.
+
+.PARAMETER ManifestPath
+    Original v2 deployment manifest used to verify active account and live ownership.
 
 .PARAMETER WaitForRevocation
     Wait for access to expire and verify revocation (adds delay).
@@ -30,6 +36,7 @@
 
 .EXAMPLE
     ./Test-Lab.ps1 -FunctionAppUrl "https://zsp-lab-gw-abc123.azurewebsites.net" `
+                   -FunctionAppResourceId "/subscriptions/.../resourceGroups/.../providers/Microsoft.Web/sites/..." `
                    -FunctionKey "your-function-key" `
                    -BackupSpObjectId "abc123" `
                    -KeyVaultResourceId "/subscriptions/.../Microsoft.KeyVault/vaults/..."
@@ -42,6 +49,12 @@ param(
 
     [Parameter(Mandatory)]
     [string]$FunctionKey,
+
+    [Parameter(Mandatory)]
+    [string]$FunctionAppResourceId,
+
+    [Parameter()]
+    [string]$ManifestPath = (Join-Path (Split-Path -Parent $PSScriptRoot) ".zsp-deployment.json"),
 
     [Parameter(Mandatory)]
     [string]$BackupSpObjectId,
@@ -58,6 +71,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
+. "$PSScriptRoot/Credential-Destinations.ps1"
+# Verify ARM metadata and manifest ownership before sending any Function key.
+$FunctionAppUrl = Get-OwnedFunctionOrigin -FunctionAppUrl $FunctionAppUrl `
+    -FunctionAppResourceId $FunctionAppResourceId -ManifestPath $ManifestPath
 
 Write-Host "`n=== ZSP Lab Smoke Tests ===" -ForegroundColor Cyan
 
@@ -74,7 +91,7 @@ function Normalize-ResourceId {
 Write-Host "`nTest 1: Health endpoint" -ForegroundColor Yellow
 try {
     $healthUrl = "$FunctionAppUrl/api/health"
-    $healthResponse = Invoke-RestMethod -Uri $healthUrl -Method GET -Headers $functionHeaders -TimeoutSec 30
+    $healthResponse = Invoke-RestMethod -Uri $healthUrl -Method GET -Headers $functionHeaders -TimeoutSec 30 -MaximumRedirection 0
 
     if ($healthResponse.status -eq 'healthy') {
         Write-Host "  PASSED: Health check returned healthy" -ForegroundColor Green
@@ -111,20 +128,21 @@ try {
         workflow_id = "manual-test"
     } | ConvertTo-Json
 
-    $nhiResponse = Invoke-RestMethod -Uri $nhiUrl -Method POST -Headers $functionHeaders -Body $body -ContentType "application/json" -TimeoutSec 60
+    $nhiResponse = Invoke-RestMethod -Uri $nhiUrl -Method POST -Headers $functionHeaders -Body $body -ContentType "application/json" -TimeoutSec 60 -MaximumRedirection 0
 
     if (-not $nhiResponse.statusQueryGetUri) {
-        throw "Durable management response did not include statusQueryGetUri"
+        throw "Lifecycle response did not include statusQueryGetUri"
     }
-    $statusQueryGetUri = [string]$nhiResponse.statusQueryGetUri
+    $statusQueryGetUri = Get-PrivateStatusUri -Value ([string]$nhiResponse.statusQueryGetUri) `
+        -Origin $FunctionAppUrl -InstanceId ([string]$nhiResponse.id)
 
     $deadline = (Get-Date).AddSeconds(90)
     $lifecycleStatus = $null
     do {
         Start-Sleep -Seconds 2
-        $lifecycleStatus = Invoke-RestMethod -Uri $nhiResponse.statusQueryGetUri -Method GET -TimeoutSec 30
+        $lifecycleStatus = Invoke-RestMethod -Uri $statusQueryGetUri -Method GET -Headers $functionHeaders -TimeoutSec 30 -MaximumRedirection 0
         if ($lifecycleStatus.runtimeStatus -in @('Failed', 'Terminated', 'Canceled')) {
-            throw "Lifecycle entered $($lifecycleStatus.runtimeStatus): $($lifecycleStatus.output | ConvertTo-Json -Compress)"
+            throw "Lifecycle entered $($lifecycleStatus.runtimeStatus); inspect authorized operator logs for details"
         }
     } until (
         $lifecycleStatus.customStatus.status -eq 'active' -or
@@ -205,7 +223,7 @@ if ($WaitForRevocation) {
 
         $revocationDeadline = (Get-Date).AddSeconds(90)
         do {
-            $revocationStatus = Invoke-RestMethod -Uri $statusQueryGetUri -Method GET -TimeoutSec 30
+            $revocationStatus = Invoke-RestMethod -Uri $statusQueryGetUri -Method GET -Headers $functionHeaders -TimeoutSec 30 -MaximumRedirection 0
             if ($revocationStatus.runtimeStatus -in @('Failed', 'Terminated', 'Canceled')) {
                 throw "Lifecycle entered $($revocationStatus.runtimeStatus) while waiting for revocation."
             }

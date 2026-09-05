@@ -8,7 +8,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Iterable, Mapping
-from urllib.parse import urlparse
+from security_boundaries import ingestion_endpoint, immutable_dcr_id
 
 from azure.identity import DefaultAzureCredential
 from azure.monitor.ingestion import LogsIngestionClient
@@ -32,14 +32,20 @@ def audit_configuration_status() -> dict:
     if not endpoint:
         issues.append("DCR_ENDPOINT is missing")
     else:
-        parsed = urlparse(endpoint)
-        if parsed.scheme.casefold() != "https" or not parsed.netloc:
-            issues.append("DCR_ENDPOINT must be an HTTPS URL")
+        try:
+            endpoint = ingestion_endpoint(endpoint)
+        except ValueError as exc:
+            issues.append(str(exc))
+            endpoint = ''
 
     if not rule_id:
         issues.append("DCR_RULE_ID is missing")
-    elif not rule_id.casefold().startswith("dcr-"):
-        issues.append("DCR_RULE_ID must be an immutable dcr- ID")
+    else:
+        try:
+            rule_id = immutable_dcr_id(rule_id)
+        except ValueError as exc:
+            issues.append(str(exc))
+            rule_id = ''
 
     return {
         "ready": not issues,
@@ -104,7 +110,8 @@ async def log_access_event(
         credential = DefaultAzureCredential()
         client = LogsIngestionClient(
             endpoint=dcr_endpoint,
-            credential=credential
+            credential=credential,
+            redirect_total=0,
         )
 
         log_entry = {

@@ -8,12 +8,73 @@ A serverless gateway that grants time-bounded Azure permissions to AI agents, au
 
 ## Validation Boundary
 
-The hardened July 25, 2026 revision passed offline Python unit/contract tests,
-PowerShell parsing, Bicep compilation, and static safety review. It was not
-freshly deployed to an Azure/Entra tenant, and no live role grant, group
+This revision is validated with offline Python unit/contract tests, real SDK
+registration and mocked transport checks, PowerShell regressions, and Bicep
+compilation. It has not been freshly deployed to an Azure/Entra tenant, and no
+live role grant, group
 membership, Durable Functions lifecycle, audit ingestion, or cleanup was run
 for this revision. Treat the smoke test and API responses as runtime checks
 that must pass in your own tenant.
+
+## Lifecycle v2 Migration — Required Before Deployment
+
+This release retires the registered `access_lifecycle_orchestrator` and
+`revocation_orchestrator` handlers and starts only
+`access_lifecycle_orchestrator_v2`. **In-flight legacy histories and timers
+cannot replay their retired handlers after the new code is deployed.** Do not
+publish this code over a running legacy task hub and assume cleanup will run.
+
+For an existing app, the operator must first:
+
+1. Restrict client admission and disable the backup timer through the approved
+   operational change process while leaving the old workers running for drain.
+   Inventory every legacy instance and its exact group membership/RBAC assignment
+   in the correct task hub; include Pending, Running, Suspended, failed, and
+   terminated histories and the standing-privilege audit hunt below.
+2. Let authorized legacy workflows finish with the old code. Verify successful
+   revocation against the actual exact entitlement IDs in Azure/Graph; elapsed
+   duration or terminal orchestration status alone is insufficient. Reconcile
+   any stranded grants using the ownership recovery runbook. Do not terminate
+   or purge a workflow as a substitute for removing its owned entitlement.
+3. Rotate any Durable extension system key previously exposed in a management
+   response before reopening admission, and verify the old key no longer
+   authenticates. Rotation is an operator security change, not performed by
+   these scripts. Restrict access during this work. The source fix cannot
+   invalidate already issued keys or management URLs. An extension key holder
+   can still invoke Durable APIs or terminate even a v2 workflow.
+4. Record the inventory, exact cleanup evidence, and key-rotation result. Then
+   deploy the new code and use the updated smoke test to verify admission,
+   authenticated status polling, and exact revocation. Retain old evidence.
+
+Microsoft documents that [Durable HTTP APIs use an extension system key](https://learn.microsoft.com/en-us/azure/durable-task/durable-functions/durable-functions-http-api)
+with broad management access. This is why management URLs must stay with
+operators and previously exposed keys must be rotated.
+
+A fresh isolated app/task hub has no legacy histories to drain, but that fact
+must be verified. `-ConfirmLifecycleMigration` is an acknowledgement of this
+operator work, **not evidence or an automatic check that it happened**. The
+script refuses all changes until it is supplied, including settings changes
+when `-SkipFunctionDeploy` is used. Direct Core Tools/zip publishing bypasses
+this script guard and still requires the same migration process.
+
+The new orchestration records policy admission in Durable history before any
+privilege operation. Preflight and grant activities also recheck current
+allowlists, supported roles, workflows, and duration. Revocation retains its
+exact ownership checks and does not require that the old grant is still in
+current admission policy. Host availability, storage history, permissions,
+manual interference, and ownership conflicts can still prevent cleanup;
+monitor and verify it rather than promising unconditional removal.
+
+Credential destinations are restricted to public Azure. `Test-Lab.ps1` now
+requires `-FunctionAppResourceId` and the original deployment manifest (default
+`.zsp-deployment.json`); it verifies the active account, live ownership tags,
+and exact ARM `defaultHostName` before sending a Function key. A supplied custom
+hostname or another app's Azure hostname is refused. `Configure-Function.ps1`
+now requires `-DceResourceId` and verifies the endpoint against that exact DCE
+in the active subscription/resource group. Runtime audit ingestion accepts only
+Azure Monitor ingestion origins and immutable `dcr-` IDs, and the SDK cannot
+follow redirects with its managed-identity token. Sovereign/custom endpoints
+require an explicitly reviewed implementation change.
 
 ## The Problem
 
@@ -119,13 +180,13 @@ cd zsp-azure-lab
 ### 2. Deploy
 
 ```powershell
-./scripts/Deploy-Lab.ps1 -ProjectName "zsp-lab" -Location "eastus" -MaxAccessDurationMinutes 480
+./scripts/Deploy-Lab.ps1 -ConfirmLifecycleMigration -ProjectName "zsp-lab" -Location "eastus" -MaxAccessDurationMinutes 480
 ```
 
 Or with custom settings:
 
 ```powershell
-./scripts/Deploy-Lab.ps1 -ProjectName "my-zsp" -Location "westus2"
+./scripts/Deploy-Lab.ps1 -ConfirmLifecycleMigration -ProjectName "my-zsp" -Location "westus2"
 ```
 
 The script:
@@ -199,7 +260,7 @@ deployment that reuses already-owned, provenance-marked Entra objects, supply
 all four IDs:
 
 ```powershell
-./scripts/Deploy-Lab.ps1 -ProjectName "zsp-lab" `
+./scripts/Deploy-Lab.ps1 -ConfirmLifecycleMigration -ProjectName "zsp-lab" `
   -ExpectedIntuneAdminGroupId "<group-object-id>" `
   -ExpectedSecurityReaderGroupId "<group-object-id>" `
   -ExpectedBackupAppObjectId "<application-object-id-not-client-id>" `
@@ -266,14 +327,33 @@ curl -X POST "$FUNCTION_URL/api/nhi-access" \
 ```
 
 The request is asynchronous. A successful admission returns HTTP `202` with a
-Durable Functions management payload, not proof that access already exists:
+restricted lifecycle polling response. Admission does not prove access already exists:
 
 ```json
 {
   "id": "<orchestration-instance-id>",
-  "statusQueryGetUri": "https://.../runtime/webhooks/durabletask/instances/..."
+  "statusQueryGetUri": "https://<function-app>.azurewebsites.net/api/access-status/<orchestration-instance-id>"
 }
 ```
+
+Validate that `statusQueryGetUri` is exactly the same verified Function origin
+and `/api/access-status/{id}` path, with no query or fragment. Send the ordinary
+Function key in `X-Functions-Key` for every poll, and do not follow redirects:
+
+```bash
+curl --max-redirs 0 "$STATUS_QUERY_GET_URI" -H "X-Functions-Key: $FUNCTION_KEY"
+```
+
+The key must authorize both the admission and status routes; the lab deployer
+uses the host's default Function key. A key limited to another individual
+Function may not authorize the status route. Never substitute a Durable
+extension system key or a host master key. The response never includes a key,
+Durable management URLs, raw orchestration input/output/history, or failure
+details. Status includes a bounded phase, expiry, counts, and only assignment
+IDs deterministically matching an admitted NHI request. It excludes admin user
+and group details. `404` means the instance is unavailable; `403` also covers
+legacy or now-disallowed instance context. Operators use their separate Azure
+management access for investigation.
 
 Poll `statusQueryGetUri` until `customStatus.status` is `active` and inspect the
 returned grants/assignment IDs before using the access. `Pending` or `Running`
@@ -282,9 +362,10 @@ without that custom status is not a grant. `Failed`, `Terminated`,
 establish usable access. Continue polling/monitoring until revocation is
 confirmed; do not assume that elapsed wall-clock time alone proves removal.
 
-Both HTTP endpoints use a Function key, so the gateway authenticates possession
+The access and status HTTP endpoints use a Function key, so the gateway authenticates possession
 of that key rather than an individual requester identity. Protect and rotate
-the key and do not expose the endpoints publicly as a production authorization
+the key. Status access is scoped by the shared key and current resource policy,
+not by an individual owner identity. Do not expose the endpoints publicly as a production authorization
 service without a stronger caller-identity layer.
 
 ---

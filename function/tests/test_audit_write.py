@@ -93,9 +93,10 @@ class FakeIngestionClient:
         self.upload_error = upload_error
         self.uploads = []
 
-    def __call__(self, *, endpoint, credential):
+    def __call__(self, *, endpoint, credential, **kwargs):
         self.endpoint = endpoint
         self.credential = credential
+        self.options = kwargs
         return self
 
     def upload(self, *, rule_id, stream_name, logs):
@@ -124,6 +125,7 @@ class AuditWriteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(caught.exception.__cause__, transport_error)
         self.assertEqual(len(client.uploads), 1)
+        self.assertEqual(client.options['redirect_total'], 0)
 
     async def test_requested_by_is_written_to_the_custom_table(self):
         client = FakeIngestionClient()
@@ -186,6 +188,17 @@ class AuditWriteTests(unittest.IsolatedAsyncioTestCase):
                 await audit.log_access_event(**GRANT_EVENT)
 
         self.assertEqual(client.uploads, [])
+
+    async def test_untrusted_endpoint_fails_before_credential_acquisition(self):
+        for endpoint in ('https://attacker.example', DCR_ENVIRONMENT['DCR_ENDPOINT'] + '?token=secret',
+                         DCR_ENVIRONMENT['DCR_ENDPOINT'] + '/redirect'):
+            with patch.dict(os.environ, {**DCR_ENVIRONMENT, 'DCR_ENDPOINT': endpoint}, clear=True), \
+                    patch.object(audit, 'DefaultAzureCredential') as credential, \
+                    patch.object(audit, 'LogsIngestionClient') as client:
+                with self.assertRaises(audit.AuditConfigurationError):
+                    await audit.log_access_event(**GRANT_EVENT)
+                credential.assert_not_called()
+                client.assert_not_called()
 
     def test_audit_configuration_rejects_non_https_or_mutable_rule_ids(self):
         with patch.dict(

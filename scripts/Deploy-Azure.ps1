@@ -317,7 +317,7 @@ if ([string]$result.properties.provisioningState -ne 'Succeeded') {
 
 $outputs = $result.properties.outputs
 $requiredOutputs = @(
-    'resourceGroupName', 'resourceGroupId', 'functionAppName', 'functionAppUrl',
+    'resourceGroupName', 'resourceGroupId', 'functionAppName', 'functionAppId', 'functionAppUrl',
     'functionAppPrincipalId', 'keyVaultId', 'keyVaultName', 'storageAccountId',
     'storageAccountName', 'logAnalyticsWorkspaceId',
     'logAnalyticsWorkspaceCustomerId', 'dataCollectionEndpointUrl',
@@ -357,6 +357,7 @@ Write-DeploymentManifest `
 Write-Output "RESOURCE_GROUP_NAME=$($outputs.resourceGroupName.value)"
 Write-Output "RESOURCE_GROUP_ID=$($outputs.resourceGroupId.value)"
 Write-Output "FUNCTION_APP_NAME=$($outputs.functionAppName.value)"
+Write-Output "FUNCTION_APP_ID=$($outputs.functionAppId.value)"
 Write-Output "FUNCTION_APP_URL=$($outputs.functionAppUrl.value)"
 Write-Output "FUNCTION_APP_PRINCIPAL_ID=$($outputs.functionAppPrincipalId.value)"
 Write-Output "KEYVAULT_ID=$($outputs.keyVaultId.value)"

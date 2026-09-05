@@ -136,7 +136,7 @@ class SetupEntraIdStaticContractTests(unittest.TestCase):
     def test_smoke_test_keeps_function_key_out_of_urls(self) -> None:
         self.assertNotIn("?code=$FunctionKey", self.test_source)
         self.assertIn("@{ 'x-functions-key' = $FunctionKey }", self.test_source)
-        self.assertEqual(self.test_source.count("-Headers $functionHeaders"), 2)
+        self.assertEqual(self.test_source.count("-Headers $functionHeaders"), 4)
 
 
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")

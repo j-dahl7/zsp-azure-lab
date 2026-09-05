@@ -2,7 +2,8 @@
 Zero Standing Privilege Gateway - Azure Function App
 
 Handles access requests for both human administrators and non-human identities.
-All access is time-bounded and automatically revoked.
+Authorized grants have Durable revocation schedules. Cleanup still depends on
+the host, retained history, ownership checks, and working cloud permissions.
 """
 
 import azure.functions as func
@@ -11,6 +12,7 @@ import logging
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from security_boundaries import status_origin, validate_instance_id
 
 from admin_access import (
     ensure_admin_entitlement_absent,
@@ -42,6 +44,7 @@ from access_safety import (
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 ADMIN_OWNER_ENTITY_NAME = "admin_entitlement_owner"
+LIFECYCLE_ORCHESTRATOR = "access_lifecycle_orchestrator_v2"
 
 
 def _same_admin_owner(state: object, requested: dict) -> bool:
@@ -140,7 +143,8 @@ def _json_response(payload: dict, status_code: int) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps(payload),
         status_code=status_code,
-        mimetype="application/json"
+        mimetype="application/json",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
     )
 
 
@@ -154,7 +158,9 @@ def _scope_is_allowed(scope: str) -> bool:
     if not allowed_scopes:
         return False
 
-    return any(scope == allowed or scope.startswith(f"{allowed}/") for allowed in allowed_scopes)
+    normalized = scope.rstrip('/').casefold()
+    return any(normalized == allowed.rstrip('/').casefold() or
+               normalized.startswith(f"{allowed.rstrip('/').casefold()}/") for allowed in allowed_scopes)
 
 
 def _nhi_roles_allowed() -> set[str]:
@@ -229,6 +235,124 @@ def _activity_payload(value) -> dict:
     return payload
 
 
+def _authorize_grant(payload: dict, access_type: str) -> dict:
+    """Apply the admission policy again at every privilege-creating boundary."""
+    maximum = _maximum_access_duration()
+    if access_type == 'admin':
+        fields = {'user_id', 'group_id', 'duration_minutes', 'justification', 'ticket_id'}
+        grant = validate_admin_request({key: value for key, value in payload.items() if key in fields}, maximum)
+        if not _admin_users_allowed() or not _object_id_is_allowed(grant['user_id'], _admin_users_allowed()):
+            raise PermissionError('Admin user is not allowed')
+        if not _admin_groups_allowed() or not _object_id_is_allowed(grant['group_id'], _admin_groups_allowed()):
+            raise PermissionError('Admin group is not allowed')
+        return grant
+    if access_type != 'nhi':
+        raise PermissionError('Unsupported grant type')
+    fields = {'sp_object_id', 'scope', 'role', 'duration_minutes', 'workflow_id'}
+    grant = validate_nhi_request({key: value for key, value in payload.items() if key in fields}, maximum)
+    if not _sp_ids_allowed() or not _object_id_is_allowed(grant['sp_object_id'], _sp_ids_allowed()):
+        raise PermissionError('Service principal is not allowed')
+    if not _scope_is_allowed(grant['scope']):
+        raise PermissionError('Resource scope is not allowed')
+    if grant['role'] not in _nhi_roles_allowed() or grant['role'] not in ROLE_DEFINITIONS:
+        raise PermissionError('Role is not allowed or supported')
+    if grant['workflow_id'] not in _workflow_ids_allowed():
+        raise PermissionError('Workflow is not allowed')
+    return grant
+
+
+def _authorize_lifecycle_input(value) -> dict:
+    data = _activity_payload(value)
+    if type(data.get('api_version')) is not int or data['api_version'] != 2:
+        raise PermissionError('Legacy lifecycle input is not accepted by this API')
+    access_type = data.get('access_type')
+    duration = data.get('duration_minutes')
+    validate_duration(duration, _maximum_access_duration())
+    if access_type in {'admin', 'nhi'}:
+        grant = _authorize_grant({**data, 'duration_minutes': duration}, access_type)
+        source = ADMIN_REQUEST_SOURCE if access_type == 'admin' else NHI_REQUEST_SOURCE
+        return {**grant, 'access_type': access_type, 'requested_by': source, 'api_version': 2}
+    if access_type != 'nhi_bundle' or not isinstance(data.get('grants'), list) or len(data['grants']) != 2:
+        raise PermissionError('Only the configured two-resource backup bundle is supported')
+    expected = {
+        (os.environ.get('KEYVAULT_RESOURCE_ID', '').rstrip('/').casefold(), 'Key Vault Secrets User'),
+        (os.environ.get('STORAGE_RESOURCE_ID', '').rstrip('/').casefold(), 'Storage Blob Data Contributor'),
+    }
+    backup_id = os.environ.get('BACKUP_SP_OBJECT_ID', '')
+    if not backup_id or any(not scope for scope, _ in expected):
+        raise PermissionError('Backup policy is not configured')
+    if any(not isinstance(grant, dict) for grant in data['grants']):
+        raise PermissionError('Every backup grant must be an object')
+    grants = [_authorize_grant({**grant, 'duration_minutes': duration}, 'nhi') for grant in data['grants']]
+    actual = {(grant['scope'].rstrip('/').casefold(), grant['role']) for grant in grants}
+    if actual != expected or any(grant['sp_object_id'].casefold() != backup_id.casefold() or grant['workflow_id'] != 'nightly-backup' for grant in grants):
+        raise PermissionError('Backup bundle does not match configured resources, identity, and workflow')
+    return {'access_type': 'nhi_bundle', 'duration_minutes': duration, 'grants': grants,
+            'workflow_id': 'nightly-backup', 'requested_by': BACKUP_TIMER_REQUEST_SOURCE, 'api_version': 2}
+
+
+def _status_projection(instance_id, record: dict, admitted: dict) -> dict:
+    runtime_status = record.get('runtimeStatus')
+    if runtime_status not in {'Running', 'Pending', 'Completed', 'Failed', 'Canceled', 'Terminated', 'Suspended', 'ContinuedAsNew'}:
+        raise ValueError('Invalid lifecycle runtime status')
+    raw_custom = record.get('customStatus')
+    raw_custom = raw_custom if isinstance(raw_custom, dict) else {}
+    allowed = {'granting', 'active', 'revoking', 'revoked', 'compensating', 'ownership_lost', 'ownership_unverified'}
+    phase = raw_custom.get('status')
+    custom = {'status': phase if isinstance(phase, str) and phase in allowed else 'pending'}
+    expiry = raw_custom.get('expires_at')
+    if isinstance(expiry, str) and len(expiry) <= 50:
+        try:
+            parsed = datetime.fromisoformat(expiry)
+            if parsed.tzinfo is not None:
+                custom['expires_at'] = parsed.isoformat()
+        except ValueError:
+            pass
+    for field in ('grant_count', 'cleanup_count'):
+        value = raw_custom.get(field)
+        if type(value) is int and 0 <= value <= 2:
+            custom[field] = value
+    # Only expose deterministic assignment IDs belonging to the admitted input;
+    # never forward arbitrary grant objects, errors, input, output, or history.
+    if isinstance(raw_custom.get('grants'), list):
+        expected = admitted['grants'] if admitted['access_type'] == 'nhi_bundle' else [admitted]
+        safe_grants = []
+        if admitted['access_type'] != 'admin':
+            actual_ids = {grant.get('assignment_id', '').casefold() for grant in raw_custom['grants'] if isinstance(grant, dict) and isinstance(grant.get('assignment_id'), str)}
+            for index, grant in enumerate(expected):
+                name = build_nhi_assignment_name(instance_id, index, grant['sp_object_id'], grant['scope'], grant['role'])
+                assignment = build_nhi_assignment_id(grant['scope'], name)
+                if assignment.casefold() in actual_ids:
+                    safe_grants.append({'assignment_id': assignment})
+        custom['grants'] = safe_grants
+    return {'id': instance_id, 'runtimeStatus': runtime_status, 'customStatus': custom}
+
+
+@app.route(route='api/access-status/{instance_id}', methods=['GET'], auth_level=func.AuthLevel.FUNCTION)
+@app.durable_client_input(client_name='client')
+async def access_status(req: func.HttpRequest, client) -> func.HttpResponse:
+    if getattr(req, 'params', {}) or not getattr(req, 'headers', {}).get('x-functions-key'):
+        return _json_response({'error': 'Use X-Functions-Key for this status endpoint; query parameters are not accepted'}, 401)
+    try:
+        instance_id = validate_instance_id(getattr(req, 'route_params', {}).get('instance_id'))
+    except ValueError:
+        return _json_response({'error': 'Invalid lifecycle instance ID'}, 400)
+    try:
+        status = await client.get_status(instance_id, show_history=False, show_history_output=False, show_input=True)
+        if not status:
+            return _json_response({'error': 'Lifecycle is not available'}, 404)
+        record = status.to_json()
+        if record.get('name') != LIFECYCLE_ORCHESTRATOR or record.get('instanceId') != instance_id:
+            return _json_response({'error': 'Lifecycle is outside this status API'}, 403)
+        admitted = _authorize_lifecycle_input(record.get('input'))
+        return _json_response(_status_projection(instance_id, record, admitted), 200)
+    except (PermissionError, RequestValidationError, ValueError, RuntimeError):
+        return _json_response({'error': 'Lifecycle context is not authorized or available'}, 403)
+    except Exception:
+        logging.error('Lifecycle status read failed for %s', instance_id)
+        return _json_response({'error': 'Lifecycle status is temporarily unavailable'}, 503)
+
+
 async def _log_failed_access_event(error: Exception, **event_fields) -> None:
     """Best-effort custom audit row without masking the activity failure."""
 
@@ -247,49 +371,50 @@ async def _start_access_lifecycle(req, client, client_input: dict) -> func.HttpR
 
     try:
         require_audit_configuration()
+        client_input = _authorize_lifecycle_input({**client_input, 'api_version': 2})
+        origin = status_origin(
+            os.environ.get('WEBSITE_HOSTNAME', ''), getattr(req, 'url', ''),
+            development=os.environ.get('AZURE_FUNCTIONS_ENVIRONMENT') == 'Development',
+        )
+    except (PermissionError, RequestValidationError):
+        return _json_response({'error': 'Lifecycle request is not authorized'}, 403)
     except Exception as exc:
-        logging.error("Audit ingestion is not ready; refusing access request: %s", exc)
+        logging.error("Lifecycle admission configuration is not ready: %s", exc)
         return _json_response(
-            {"error": "Audit logging is not configured; no access was granted"},
+            {"error": "Audit logging or lifecycle admission configuration is not ready; no access was granted"},
             503,
         )
 
     try:
         instance_id = await client.start_new(
-            "access_lifecycle_orchestrator",
+            LIFECYCLE_ORCHESTRATOR,
             client_input=client_input,
         )
     except Exception as exc:
         logging.error("Unable to start access lifecycle orchestration: %s", exc)
         return _json_response(
-            {"error": "Durable access scheduling is unavailable; no access was granted"},
+            {"error": "Lifecycle admission outcome could not be confirmed; inspect operator history and entitlements before retrying"},
             503,
         )
 
-    if not isinstance(instance_id, str) or not instance_id.strip():
-        logging.error("Durable Functions returned an empty lifecycle instance ID")
-        return _json_response(
-            {"error": "Durable access scheduling is unavailable; no access was granted"},
-            503,
-        )
-
-    # The Durable management response is deliberately asynchronous. Clients can
-    # inspect customStatus for `active` and later `revoked`; the HTTP trigger
-    # itself never creates privilege before this instance is durably recorded.
     try:
-        return client.create_check_status_response(req, instance_id)
-    except Exception as exc:
-        # History is already committed at this point. Preserve the accepted
-        # response so a response-construction edge case cannot prompt a client
-        # retry and create a second lifecycle.
-        logging.error("Unable to build Durable management response for %s: %s", instance_id, exc)
+        validate_instance_id(instance_id)
+    except ValueError:
+        logging.error("Durable Functions returned an invalid lifecycle instance ID")
         return _json_response(
-            {
-                "status": "accepted",
-                "orchestrator_instance_id": instance_id,
-            },
-            202,
+            {"error": "Lifecycle admission outcome could not be confirmed; inspect operator history and entitlements before retrying"},
+            503,
         )
+
+    # Never return Durable's management payload: its URLs contain an extension
+    # system key capable of starting, terminating and purging other lifecycles.
+    # Preserve the polling field while requiring the app's ordinary function
+    # authentication header at a read-only, policy-scoped endpoint.
+    return _json_response({
+        'id': instance_id,
+        'status': 'accepted',
+        'statusQueryGetUri': f'{origin}/api/access-status/{instance_id}',
+    }, 202)
 
 # =============================================================================
 # HTTP TRIGGERS - Access Request Endpoints
@@ -468,18 +593,20 @@ async def backup_job_access_grant(timer: func.TimerRequest, client):
             )
             grants.append(request)
 
-        instance_id = await client.start_new(
-            "access_lifecycle_orchestrator",
-            client_input={
+        client_input = _authorize_lifecycle_input({
                 "access_type": "nhi_bundle",
                 "duration_minutes": duration,
                 "workflow_id": "nightly-backup",
                 "requested_by": BACKUP_TIMER_REQUEST_SOURCE,
                 "grants": grants,
-            },
+                "api_version": 2,
+            })
+        instance_id = await client.start_new(
+            LIFECYCLE_ORCHESTRATOR,
+            client_input=client_input,
         )
         if not isinstance(instance_id, str) or not instance_id.strip():
-            raise RuntimeError("Durable Functions returned an empty lifecycle instance ID")
+            raise RuntimeError("Durable Functions returned an invalid lifecycle instance ID")
         logging.info(
             "Backup access lifecycle %s accepted for %s minutes; no grant was created by the timer trigger",
             instance_id,
@@ -496,8 +623,25 @@ async def backup_job_access_grant(timer: func.TimerRequest, client):
 # DURABLE FUNCTIONS - Grant, Wait, and Revoke Saga
 # =============================================================================
 
-@app.orchestration_trigger(context_name="context")
-def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
+@app.activity_trigger(input_name='activityPayload')
+async def authorize_access_lifecycle_activity(activityPayload):
+    require_audit_configuration()
+    return _authorize_lifecycle_input(activityPayload)
+
+
+@app.orchestration_trigger(context_name='context')
+def access_lifecycle_orchestrator_v2(context: df.DurableOrchestrationContext):
+    # Record policy authorization in Durable history, never read changing app
+    # settings inside a replay. Every grant activity also rechecks current policy.
+    admitted = yield context.call_activity_with_retry(
+        'authorize_access_lifecycle_activity', df.RetryOptions(5000, 5), context.get_input()
+    )
+    if not isinstance(admitted, dict) or admitted.get('api_version') != 2:
+        raise PermissionError('Authorization activity did not return a v2 admission')
+    return (yield from _access_lifecycle_saga(context, admitted))
+
+
+def _access_lifecycle_saga(context: df.DurableOrchestrationContext, input_data: dict):
     """Own the complete entitlement lifecycle inside Durable history.
 
     The HTTP and timer triggers only start this orchestration.  Preflight, grant,
@@ -505,7 +649,6 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
     from recorded history instead of stranding an out-of-band grant.
     """
 
-    input_data = context.get_input()
     if not isinstance(input_data, dict):
         raise ValueError("Access lifecycle input must be an object")
 
@@ -887,11 +1030,10 @@ def access_lifecycle_orchestrator(context: df.DurableOrchestrationContext):
     }
 
 
-# Backward compatibility for already-scheduled lab instances created by older
-# deployments. New requests never use this revoke-only orchestration.
-
-@app.orchestration_trigger(context_name="context")
-def revocation_orchestrator(context: df.DurableOrchestrationContext):
+# The former revoke-only handler is deliberately not registered. Its old input
+# did not prove ownership or admission, so a Durable key could invoke arbitrary
+# revocations. Drain/reconcile legacy histories before this version is deployed.
+def _legacy_revocation_orchestrator_for_review(context: df.DurableOrchestrationContext):
     """
     Orchestrator that waits until expiry time, then revokes access.
     """
@@ -935,6 +1077,7 @@ async def check_admin_entitlement_activity(activityPayload):
     """Record absence in Durable history before a group membership is added."""
 
     input_data = _activity_payload(activityPayload)
+    _authorize_grant(input_data, 'admin')
     await ensure_admin_entitlement_absent(
         user_id=input_data["user_id"],
         group_id=input_data["group_id"],
@@ -951,6 +1094,7 @@ async def grant_admin_access_activity(activityPayload):
     # Admission also checks this, but an accepted Durable instance can outlive
     # an app-setting change or be replayed after a deployment.
     require_audit_configuration()
+    _authorize_grant(input_data, 'admin')
     lifecycle_id = input_data.get("lifecycle_id") or input_data.get(
         "orchestration_instance_id"
     )
@@ -1007,6 +1151,7 @@ async def check_nhi_entitlement_activity(activityPayload):
     """Record exact RBAC absence before the deterministic assignment is made."""
 
     input_data = _activity_payload(activityPayload)
+    _authorize_grant(input_data, 'nhi')
     await ensure_nhi_entitlement_absent(
         sp_object_id=input_data["sp_object_id"],
         scope=input_data["scope"],
@@ -1021,6 +1166,7 @@ async def grant_nhi_access_activity(activityPayload):
 
     input_data = _activity_payload(activityPayload)
     require_audit_configuration()
+    _authorize_grant(input_data, 'nhi')
     lifecycle_id = input_data.get("lifecycle_id") or input_data.get(
         "orchestration_instance_id"
     )
