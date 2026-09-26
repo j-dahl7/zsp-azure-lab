@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Configures the Function App with Entra ID and Azure resource settings.
@@ -51,7 +51,7 @@
     Maximum access duration in minutes.
 
 .PARAMETER BackupJobSchedule
-    NCRONTAB schedule for backup job timer trigger. Default: '0 55 1 * * *' (1:55 AM daily).
+    NCRONTAB schedule for backup job timer trigger. Default: '0 55 1 * * *' (01:55 UTC daily; Flex Consumption does not support WEBSITE_TIME_ZONE/TZ).
 
 .PARAMETER BackupJobDurationMinutes
     Duration in minutes for backup job access grants. Default: 35.
@@ -106,6 +106,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot/Credential-Destinations.ps1"
 $DcrEndpoint = Get-VerifiedIngestionEndpoint -Endpoint $DcrEndpoint `
@@ -132,7 +133,7 @@ $settings = @(
 
 # Update Function App settings
 Write-Host "  Updating app settings..." -ForegroundColor Cyan
-az functionapp config appsettings set `
+Invoke-ZspAz functionapp config appsettings set `
     --name $FunctionAppName `
     --resource-group $ResourceGroupName `
     --settings $settings `
@@ -141,6 +142,16 @@ az functionapp config appsettings set `
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to update Function App settings"
 }
+
+# An exact old connection-string setting takes precedence over an identity
+# prefix. Remove only these two known legacy settings after the owned Bicep
+# deployment establishes identity endpoints and host-storage role assignments.
+Invoke-ZspAz functionapp config appsettings delete `
+    --name $FunctionAppName `
+    --resource-group $ResourceGroupName `
+    --setting-names AzureWebJobsStorage DEPLOYMENT_STORAGE_CONNECTION_STRING `
+    --output none 2>$null
+if ($LASTEXITCODE -ne 0) { throw 'Could not remove legacy host-storage connection settings; deployment remains unvalidated.' }
 
 Write-Host "  Settings configured:" -ForegroundColor Green
 foreach ($setting in $settings) {

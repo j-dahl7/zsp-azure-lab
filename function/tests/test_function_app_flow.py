@@ -503,6 +503,17 @@ class EndpointAllowlistTests(unittest.IsolatedAsyncioTestCase):
 
         self._assert_refused(response, client, 403, "Requested scope is not allowed")
 
+    async def test_nhi_refuses_noncanonical_scope_before_starting_a_lifecycle(self):
+        for suffix in ('/..', '/child/../other', '/%2e%2e', '/a\tb'):
+            with self.subTest(suffix=suffix):
+                response, client = await self._nhi_request(
+                    {"ALLOWED_NHI_SP_OBJECT_IDS": SP_ID, "ALLOWED_SCOPE_IDS": SCOPE},
+                    self._nhi_body(scope=SCOPE + suffix),
+                )
+                self._assert_refused(response, client, 400, "canonical")
+                with patch.dict(os.environ, {"ALLOWED_SCOPE_IDS": SCOPE}, clear=True):
+                    self.assertFalse(function_app._scope_is_allowed(SCOPE + suffix))
+
     async def test_nhi_refuses_when_the_service_principal_allowlist_is_unset(self):
         response, client = await self._nhi_request(
             {"ALLOWED_SCOPE_IDS": SCOPE},

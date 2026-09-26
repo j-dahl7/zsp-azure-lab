@@ -9,7 +9,9 @@ param projectName string
 @description('Azure region')
 param location string
 
-@description('Deployer principal ID for Key Vault admin access')
+// Retained for deployment-input compatibility; no standing data-plane role is created.
+@description('Legacy deployer input; no Key Vault Administrator grant is created')
+#disable-next-line no-unused-params
 param deployerPrincipalId string
 
 @description('Tags for all resources')
@@ -26,7 +28,7 @@ var resourceTags = union({
 }, tags)
 
 // Key Vault - Target resource for NHI demo
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+resource keyVault 'Microsoft.KeyVault/vaults@2026-02-01' = {
   name: take('${projectName}-kv${uniqueSuffix}', 24)
   location: location
   tags: resourceTags
@@ -42,27 +44,13 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   }
 }
 
-// Grant deployer Key Vault Administrator role
-resource deployerKvAdmin 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, deployerPrincipalId, 'Key Vault Administrator')
-  scope: keyVault
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '00482a5a-887f-4fb3-b363-3b7fe8e74483') // Key Vault Administrator
-    principalId: deployerPrincipalId
-    principalType: 'User'
-  }
-}
-
 // Demo secret in Key Vault
-resource demoSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+resource demoSecret 'Microsoft.KeyVault/vaults/secrets@2026-02-01' = {
   parent: keyVault
   name: 'demo-secret'
   properties: {
-    value: 'This secret should only be accessible during backup window'
+    value: 'Demo target for time-bound backup access; other authorized administrators may still have access'
   }
-  dependsOn: [
-    deployerKvAdmin
-  ]
 }
 
 // Storage Account - Target resource for NHI demo
@@ -77,6 +65,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   properties: {
     minimumTlsVersion: 'TLS1_2'
     allowBlobPublicAccess: false
+    allowSharedKeyAccess: false
     supportsHttpsTrafficOnly: true
   }
 }

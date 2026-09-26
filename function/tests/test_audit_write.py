@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,7 +64,7 @@ def tearDownModule():
 # client, so the names only have to exist for the import to succeed.
 _stub_module("azure")
 identity_module = _stub_module("azure.identity")
-_stub_attribute(identity_module, "DefaultAzureCredential", object)
+_stub_attribute(identity_module, "ManagedIdentityCredential", object)
 _stub_module("azure.monitor")
 ingestion_module = _stub_module("azure.monitor.ingestion")
 _stub_attribute(ingestion_module, "LogsIngestionClient", object)
@@ -86,6 +87,11 @@ GRANT_EVENT = {
 }
 
 
+class FakeCredential:
+    def __enter__(self): return self
+    def __exit__(self, *args): self.closed = True
+
+
 class FakeIngestionClient:
     """Stand in for LogsIngestionClient and record what would have been sent."""
 
@@ -99,7 +105,12 @@ class FakeIngestionClient:
         self.options = kwargs
         return self
 
+    def __enter__(self): return self
+
+    def __exit__(self, *args): self.closed = True
+
     def upload(self, *, rule_id, stream_name, logs):
+        self.upload_thread = threading.get_ident()
         self.uploads.append((rule_id, stream_name, logs))
         if self.upload_error:
             raise self.upload_error
@@ -111,7 +122,7 @@ class AuditWriteTests(unittest.IsolatedAsyncioTestCase):
         fields.update(overrides)
         with (
             patch.dict(os.environ, DCR_ENVIRONMENT, clear=True),
-            patch.object(audit, "DefaultAzureCredential", object),
+            patch.object(audit, "ManagedIdentityCredential", FakeCredential),
             patch.object(audit, "LogsIngestionClient", client),
         ):
             await audit.log_access_event(**fields)
@@ -125,7 +136,10 @@ class AuditWriteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(caught.exception.__cause__, transport_error)
         self.assertEqual(len(client.uploads), 1)
-        self.assertEqual(client.options['redirect_total'], 0)
+        self.assertIs(client.options['permit_redirects'], False)
+        self.assertTrue(client.closed)
+        self.assertTrue(client.credential.closed)
+        self.assertNotEqual(client.upload_thread, threading.get_ident())
 
     async def test_requested_by_is_written_to_the_custom_table(self):
         client = FakeIngestionClient()
@@ -193,7 +207,7 @@ class AuditWriteTests(unittest.IsolatedAsyncioTestCase):
         for endpoint in ('https://attacker.example', DCR_ENVIRONMENT['DCR_ENDPOINT'] + '?token=secret',
                          DCR_ENVIRONMENT['DCR_ENDPOINT'] + '/redirect'):
             with patch.dict(os.environ, {**DCR_ENVIRONMENT, 'DCR_ENDPOINT': endpoint}, clear=True), \
-                    patch.object(audit, 'DefaultAzureCredential') as credential, \
+                    patch.object(audit, 'ManagedIdentityCredential') as credential, \
                     patch.object(audit, 'LogsIngestionClient') as client:
                 with self.assertRaises(audit.AuditConfigurationError):
                     await audit.log_access_event(**GRANT_EVENT)

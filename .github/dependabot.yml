@@ -14,7 +14,7 @@ updates:
     labels:
       - "dependencies"
     ignore:
-      # This Function App is deployed on Python 3.11. azure-functions 2.x is
+      # This Function App is deployed on Python 3.12. azure-functions 2.x is
       # specifically the Python 3.13+ package line.
       - dependency-name: "azure-functions"
         update-types:

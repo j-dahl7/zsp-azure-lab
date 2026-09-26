@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Grants Graph API and Azure RBAC permissions to the Function App managed identity.
@@ -6,7 +6,6 @@
 .DESCRIPTION
     Grants the following permissions with admin consent:
     - GroupMember.ReadWrite.All (Graph API): Add/remove group members
-    - Directory.Read.All (Graph API): Read directory objects
     - RoleManagement.ReadWrite.Directory (Graph API): Manage membership of role-assignable groups
     - User Access Administrator (Azure RBAC): Manage role assignments on resource group
     - Monitoring Metrics Publisher (Azure RBAC): Send audit logs to DCR
@@ -46,6 +45,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 
 # Helper: Write JSON to temp file for cross-platform az rest compatibility
 # Avoids PS 7.0-7.2 Windows bug where double quotes are stripped from native command args
@@ -66,14 +66,14 @@ function Assert-AzCommandSucceeded {
 
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
+        if ($script:ZspLastCliError) { throw $script:ZspLastCliError }
         throw "Azure CLI failed to $Operation (exit code $exitCode)."
     }
 }
 
 # Well-known IDs
 $MsGraphAppId = '00000003-0000-0000-c000-000000000000'
-$GroupMemberReadWriteAllId = '62a82d76-70ea-41e2-9197-370581804d09'
-$DirectoryReadAllId = '7ab1d382-f21e-4acd-a863-ba3e13f7da61'
+$GroupMemberReadWriteAllId = 'dbaae8cf-10b5-4b86-a4a1-f871c94c6695'
 $RoleManagementReadWriteDirectoryId = '9e3f62cf-ca93-4989-b6ce-bf83c28f9fe8'
 $UserAccessAdminRoleId = '18d7d88d-d35e-4fb5-a5c3-7773c20a72d9'
 
@@ -81,7 +81,7 @@ Write-Host "Granting permissions to Function App managed identity..." -Foregroun
 
 # Get Microsoft Graph service principal
 Write-Host "  Looking up Microsoft Graph service principal..." -ForegroundColor Cyan
-$msgraph = az ad sp show --id $MsGraphAppId --output json 2>$null | ConvertFrom-Json
+$msgraph = Invoke-ZspAz ad sp show --id $MsGraphAppId --output json 2>$null | ConvertFrom-Json
 
 if (-not $msgraph) {
     throw "Could not find Microsoft Graph service principal"
@@ -91,7 +91,7 @@ Write-Host "    Found: $msgraphObjectId" -ForegroundColor Green
 
 # Grant GroupMember.ReadWrite.All
 Write-Host "  Granting GroupMember.ReadWrite.All..." -ForegroundColor Cyan
-$existingGroupPerm = az rest --method GET `
+$existingGroupPerm = Invoke-ZspAz rest --method GET `
     --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$FunctionAppPrincipalId/appRoleAssignments" `
     --output json 2>$null | ConvertFrom-Json
 
@@ -109,7 +109,7 @@ else {
 
     for ($i = 1; $i -le $MaxRetries; $i++) {
         try {
-            az rest --method POST `
+            Invoke-ZspAz rest --method POST `
                 --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$FunctionAppPrincipalId/appRoleAssignments" `
                 --headers "Content-Type=application/json" `
                 --body (New-JsonBodyFile $body) `
@@ -119,7 +119,7 @@ else {
             break
         }
         catch {
-            if ($i -eq $MaxRetries) {
+            if ($i -eq $MaxRetries -or $_.Exception.Data['AzureCliRetryable'] -ne $true) {
                 throw "Failed to grant GroupMember.ReadWrite.All after $MaxRetries attempts"
             }
             Write-Host "    Retry $i/$MaxRetries..." -ForegroundColor Yellow
@@ -128,39 +128,17 @@ else {
     }
 }
 
-# Grant Directory.Read.All
-Write-Host "  Granting Directory.Read.All..." -ForegroundColor Cyan
-$hasDirectoryPerm = $existingGroupPerm.value | Where-Object { $_.appRoleId -eq $DirectoryReadAllId }
-
-if ($hasDirectoryPerm) {
-    Write-Host "    Already granted" -ForegroundColor Green
-}
-else {
-    $body = @{
-        principalId = $FunctionAppPrincipalId
-        resourceId = $msgraphObjectId
-        appRoleId = $DirectoryReadAllId
-    } | ConvertTo-Json -Compress
-
-    for ($i = 1; $i -le $MaxRetries; $i++) {
-        try {
-            az rest --method POST `
-                --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$FunctionAppPrincipalId/appRoleAssignments" `
-                --headers "Content-Type=application/json" `
-                --body (New-JsonBodyFile $body) `
-                --output none 2>$null
-            Assert-AzCommandSucceeded -Operation 'grant Directory.Read.All'
-            Write-Host "    Granted" -ForegroundColor Green
-            break
-        }
-        catch {
-            if ($i -eq $MaxRetries) {
-                throw "Failed to grant Directory.Read.All after $MaxRetries attempts"
-            }
-            Write-Host "    Retry $i/$MaxRetries..." -ForegroundColor Yellow
-            Start-Sleep -Seconds $RetryDelaySeconds
-        }
-    }
+# Older revisions also granted Directory.Read.All and accidentally used the
+# Group.ReadWrite.All GUID. New deployments need neither. Existing assignments
+# are not silently removed: inspect their exact IDs and use the dedicated
+# migration helper after reviewing this managed identity's other consumers.
+$legacyBroadRoles = @('62a82d76-70ea-41e2-9197-370581804d09', '7ab1d382-f21e-4acd-a863-ba3e13f7da61')
+$legacyAssignments = @($existingGroupPerm.value | Where-Object {
+    $_.resourceId -eq $msgraphObjectId -and $_.appRoleId -in $legacyBroadRoles
+})
+if ($legacyAssignments.Count) {
+    Write-Warning 'Legacy broad Graph grants remain. Review exact assignment IDs and use Remove-LegacyGraphGrants.ps1 -WhatIf before migration.'
+    $legacyAssignments | Select-Object id, appRoleId, principalId, resourceId | Format-Table | Out-Host
 }
 
 # Grant RoleManagement.ReadWrite.Directory (required for role-assignable group membership)
@@ -192,7 +170,7 @@ else {
 
     for ($i = 1; $i -le $MaxRetries; $i++) {
         try {
-            az rest --method POST `
+            Invoke-ZspAz rest --method POST `
                 --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$FunctionAppPrincipalId/appRoleAssignments" `
                 --headers "Content-Type=application/json" `
                 --body (New-JsonBodyFile $body) `
@@ -202,7 +180,7 @@ else {
             break
         }
         catch {
-            if ($i -eq $MaxRetries) {
+            if ($i -eq $MaxRetries -or $_.Exception.Data['AzureCliRetryable'] -ne $true) {
                 throw "Failed to grant RoleManagement.ReadWrite.Directory after $MaxRetries attempts"
             }
             Write-Host "    Retry $i/$MaxRetries..." -ForegroundColor Yellow
@@ -213,7 +191,7 @@ else {
 
 # Grant User Access Administrator RBAC role on resource group
 Write-Host "  Granting User Access Administrator on resource group..." -ForegroundColor Cyan
-$existingRbac = az role assignment list `
+$existingRbac = Invoke-ZspAz role assignment list `
     --assignee $FunctionAppPrincipalId `
     --scope $ResourceGroupId `
     --role "User Access Administrator" `
@@ -225,7 +203,7 @@ if ($existingRbac -and $existingRbac.Count -gt 0) {
 else {
     for ($i = 1; $i -le $MaxRetries; $i++) {
         try {
-            az role assignment create `
+            Invoke-ZspAz role assignment create `
                 --assignee-object-id $FunctionAppPrincipalId `
                 --assignee-principal-type ServicePrincipal `
                 --role "User Access Administrator" `
@@ -236,7 +214,7 @@ else {
             break
         }
         catch {
-            if ($i -eq $MaxRetries) {
+            if ($i -eq $MaxRetries -or $_.Exception.Data['AzureCliRetryable'] -ne $true) {
                 throw "Failed to grant User Access Administrator after $MaxRetries attempts"
             }
             Write-Host "    Retry $i/$MaxRetries..." -ForegroundColor Yellow
@@ -248,7 +226,7 @@ else {
 # Grant Monitoring Metrics Publisher on DCR (for audit log ingestion)
 if ($DcrScope) {
     Write-Host "  Granting Monitoring Metrics Publisher on DCR..." -ForegroundColor Cyan
-    $existingMonitor = az role assignment list `
+    $existingMonitor = Invoke-ZspAz role assignment list `
         --assignee $FunctionAppPrincipalId `
         --scope $DcrScope `
         --role "Monitoring Metrics Publisher" `
@@ -260,7 +238,7 @@ if ($DcrScope) {
     else {
         for ($i = 1; $i -le $MaxRetries; $i++) {
             try {
-                az role assignment create `
+                Invoke-ZspAz role assignment create `
                     --assignee-object-id $FunctionAppPrincipalId `
                     --assignee-principal-type ServicePrincipal `
                     --role "Monitoring Metrics Publisher" `
@@ -271,7 +249,7 @@ if ($DcrScope) {
                 break
             }
             catch {
-                if ($i -eq $MaxRetries) {
+                if ($i -eq $MaxRetries -or $_.Exception.Data['AzureCliRetryable'] -ne $true) {
                     throw "Failed to grant Monitoring Metrics Publisher after $MaxRetries attempts"
                 }
                 Write-Host "    Retry $i/$MaxRetries..." -ForegroundColor Yellow

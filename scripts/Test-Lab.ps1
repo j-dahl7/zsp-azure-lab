@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Runs smoke tests on the deployed ZSP lab.
@@ -70,6 +70,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 $PSNativeCommandUseErrorActionPreference = $false
 . "$PSScriptRoot/Credential-Destinations.ps1"
 # Verify ARM metadata and manifest ownership before sending any Function key.
@@ -176,7 +177,7 @@ try {
     if (-not $assignmentId) {
         throw 'The lifecycle did not return an assignment ID; exact role verification cannot run.'
     }
-    $assignmentJson = az role assignment list `
+    $assignmentJson = Invoke-ZspAz role assignment list `
         --assignee $BackupSpObjectId `
         --scope $KeyVaultResourceId `
         --output json 2>$null
@@ -238,7 +239,7 @@ if ($WaitForRevocation) {
             throw 'Lifecycle did not report revoked state before the verification timeout.'
         }
 
-        $assignmentJson = az role assignment list `
+        $assignmentJson = Invoke-ZspAz role assignment list `
             --assignee $BackupSpObjectId `
             --scope $KeyVaultResourceId `
             --output json 2>$null

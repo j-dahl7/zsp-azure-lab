@@ -46,6 +46,12 @@ class CredentialBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell 7 is required')
+    def test_native_cli_error_contract_without_azure(self):
+        result = subprocess.run(['pwsh', '-NoProfile', '-File', str(ROOT / 'scripts/tests/Test-AzureCli.ps1')],
+                                capture_output=True, text=True, cwd=ROOT, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(shutil.which('pwsh'), 'PowerShell 7 is required')
     def test_powershell_credential_destinations_and_migration_gate(self):
         result = subprocess.run(['pwsh', '-NoProfile', '-File', str(ROOT / 'scripts/tests/Test-CredentialDestinations.ps1')],
                                 capture_output=True, text=True, cwd=ROOT, timeout=60)

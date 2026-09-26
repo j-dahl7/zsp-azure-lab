@@ -163,7 +163,11 @@ def validate_scope(value: Any) -> str:
 
     if not isinstance(value, str) or not value or len(value) > 1024:
         raise RequestValidationError("scope must be an Azure resource ID")
-    if value != value.strip() or "\\" in value or "?" in value or "#" in value:
+    if (
+        any(character in value for character in ("\\", "?", "#", "%"))
+        or any(ord(character) <= 32 or ord(character) == 127 for character in value)
+        or value != value.strip()
+    ):
         raise RequestValidationError("scope must be a canonical Azure resource ID")
 
     segments = value.split("/")
@@ -173,11 +177,32 @@ def validate_scope(value: Any) -> str:
         len(segments) < 5
         or segments[0] != ""
         or segments[1].casefold() != "subscriptions"
-        or any(not segment for segment in segments[1:])
+        or any(not segment or segment in {".", ".."} for segment in segments[1:])
     ):
         raise RequestValidationError("scope must be a canonical Azure resource ID")
     validate_object_id(segments[2], "scope subscription ID")
     return value
+
+
+def scope_segments(value: str) -> tuple[str, ...]:
+    """Compare canonical path components without compatibility Unicode folding.
+
+    ARM's structural names and the lab's resource names are ASCII-insensitive.
+    Non-ASCII resource-group spelling is preserved, rather than conflating
+    distinct names through casefold expansions such as sharp-s to double-s.
+    """
+    value = validate_scope(value)
+    ascii_lower = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+    return tuple(segment.translate(ascii_lower) for segment in value.split("/")[1:])
+
+
+def scope_is_within(requested: str, allowed: str) -> bool:
+    """Fail closed on noncanonical input before comparing a whole-segment prefix."""
+    try:
+        requested_parts, allowed_parts = scope_segments(requested), scope_segments(allowed)
+    except RequestValidationError:
+        return False
+    return requested_parts[:len(allowed_parts)] == allowed_parts
 
 
 def _validate_text(

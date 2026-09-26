@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import sys
 import types
+import asyncio
+from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Binding/transport probe isolates unrelated Graph/RBAC SDK imports. CI also
 # imports the entire actual runtime separately in its hash-locked environment.
@@ -23,6 +25,37 @@ from azure.core.pipeline.transport import HttpTransport, HttpResponse
 from azure.monitor.ingestion import LogsIngestionClient
 from azure.durable_functions.models.DurableOrchestrationStatus import DurableOrchestrationStatus
 from azure.durable_functions.models.OrchestrationRuntimeStatus import OrchestrationRuntimeStatus
+from client_lifecycle import graph_client as managed_graph_client
+
+
+async def verify_managed_graph_lifetime():
+    # Construct and close the actual Graph adapter without requesting a token
+    # or sending HTTP. This catches SDK factory/signature incompatibilities.
+    from msgraph_core import GraphClientFactory
+    created_credentials = []
+    created_clients = []
+    factory = GraphClientFactory.create_with_default_middleware
+
+    class NoNetworkCredential:
+        def __init__(self): self.closed = False; created_credentials.append(self)
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): self.closed = True
+        async def get_token(self, *args, **kwargs): raise AssertionError('No token request is allowed')
+
+    def recorded_factory(*args, **kwargs):
+        client = factory(*args, **kwargs)
+        created_clients.append(client)
+        return client
+
+    with patch('azure.identity.aio.ManagedIdentityCredential', NoNetworkCredential), \
+         patch.object(GraphClientFactory, 'create_with_default_middleware', recorded_factory):
+        async with managed_graph_client(None) as graph:
+            assert graph.groups is not None
+    assert created_credentials[0].closed
+    assert created_clients[0].is_closed
+
+
+asyncio.run(verify_managed_graph_lifetime())
 
 bindings = {item.get_function_name(): item.get_bindings_dict()['bindings'] for item in function_app.app.get_functions()}
 assert 'access_lifecycle_orchestrator' not in bindings
@@ -64,7 +97,7 @@ class Transport(HttpTransport):
 
 transport = Transport()
 client = LogsIngestionClient('https://example-dce.eastus-1.ingest.monitor.azure.com', Credential(),
-                            redirect_total=0, retry_total=0, transport=transport)
+                            permit_redirects=False, retry_total=0, transport=transport)
 try:
     client.upload(rule_id='dcr-' + '0' * 32, stream_name='Custom-ZSPAudit_CL', logs=[{'EventType': 'offline-test'}])
 except HttpResponseError:

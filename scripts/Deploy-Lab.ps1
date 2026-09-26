@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Deploys the Zero Standing Privilege lab infrastructure.
@@ -66,7 +66,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [ValidatePattern('^[a-z0-9-]+$')]
+    [ValidatePattern('^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$')]
     [ValidateLength(3, 20)]
     [string]$ProjectName = 'zsp-lab',
 
@@ -107,6 +107,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 # This gate precedes ALL changes, including settings that could alter old grants.
 if (-not $ConfirmLifecycleMigration) {
     throw 'Before deployment, confirm a fresh app or completed legacy lifecycle drain, exact grant reconciliation, and rotation of previously exposed Durable extension keys. Read README lifecycle migration, then pass -ConfirmLifecycleMigration. This flag performs no drain or key rotation.'
@@ -134,14 +135,14 @@ Write-Host ""
 
 # Verify prerequisites
 Write-Host "Checking prerequisites..." -ForegroundColor Yellow
-$azVersion = az version --output json 2>$null | ConvertFrom-Json
+$azVersion = Invoke-ZspAz version --output json 2>$null | ConvertFrom-Json
 if (-not $azVersion) {
     throw "Azure CLI not found. Install from https://aka.ms/installazurecli"
 }
 Write-Host "  Azure CLI: $($azVersion.'azure-cli')" -ForegroundColor Green
 
 # Check logged in
-$account = az account show --output json 2>$null | ConvertFrom-Json
+$account = Invoke-ZspAz account show --output json 2>$null | ConvertFrom-Json
 if (-not $account) {
     throw "Not logged in to Azure. Run 'az login' first."
 }
@@ -149,13 +150,25 @@ Write-Host "  Subscription: $($account.name)" -ForegroundColor Green
 Write-Host "  Tenant: $($account.tenantId)" -ForegroundColor Green
 
 # Get deployer principal ID
-$deployerPrincipalId = az ad signed-in-user show --query id -o tsv 2>$null
+$deployerPrincipalId = Invoke-ZspAz ad signed-in-user show --query id -o tsv 2>$null
 if (-not $deployerPrincipalId) {
     throw "Could not get signed-in user. Ensure you're logged in with 'az login'."
 }
 Write-Host "  Deployer: $deployerPrincipalId" -ForegroundColor Green
 
 Write-Host ""
+
+# Preserve recorded duration on reruns unless the operator explicitly changes it.
+if ((Test-Path -LiteralPath $ManifestPath -PathType Leaf) -and -not $PSBoundParameters.ContainsKey('MaxAccessDurationMinutes')) {
+    $priorManifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    if ($priorManifest.PSObject.Properties.Name -contains 'max_access_duration_minutes') {
+        $savedDuration = 0
+        if (-not [int]::TryParse([string]$priorManifest.max_access_duration_minutes, [ref]$savedDuration) -or $savedDuration -lt 5 -or $savedDuration -gt 1440) {
+            throw 'Recorded access duration is invalid; review the manifest before rerunning.'
+        }
+        $MaxAccessDurationMinutes = $savedDuration
+    }
+}
 
 # Step 1: Deploy Azure Resources
 Write-Host "Step 1/7: Deploying Azure resources (Bicep)..." -ForegroundColor Cyan
@@ -306,6 +319,9 @@ $deploymentManifest = [ordered]@{
     subscription_id                = $config['SUBSCRIPTION_ID']
     resource_group_name            = $config['RESOURCE_GROUP_NAME']
     resource_group_id              = $config['RESOURCE_GROUP_ID']
+    function_app_id                = $config['FUNCTION_APP_ID']
+    function_app_principal_id      = $config['FUNCTION_APP_PRINCIPAL_ID']
+    max_access_duration_minutes    = $MaxAccessDurationMinutes
     intune_admin_group_id          = $config['INTUNE_ADMIN_GROUP_ID']
     security_reader_group_id       = $config['SECURITY_READER_GROUP_ID']
     backup_app_object_id           = $config['BACKUP_APP_OBJECT_ID']
@@ -376,7 +392,7 @@ $tableBody = @{
     }
 } | ConvertTo-Json -Depth 10 -Compress
 
-az rest --method PUT `
+Invoke-ZspAz rest --method PUT `
     --uri "https://management.azure.com${workspaceId}/tables/ZSPAudit_CL?api-version=2022-10-01" `
     --headers "Content-Type=application/json" `
     --body (New-JsonBodyFile $tableBody) `
@@ -437,7 +453,7 @@ $dcrBody = @{
     }
 } | ConvertTo-Json -Depth 10 -Compress
 
-$dcrJson = az rest --method PUT `
+$dcrJson = Invoke-ZspAz rest --method PUT `
     --uri "https://management.azure.com/subscriptions/$($config['SUBSCRIPTION_ID'])/resourceGroups/$rgName/providers/Microsoft.Insights/dataCollectionRules/$ProjectName-dcr?api-version=2022-06-01" `
     --headers "Content-Type=application/json" `
     --body (New-JsonBodyFile $dcrBody) `
@@ -557,7 +573,7 @@ if (-not $SkipFunctionDeploy) {
                 }
                 Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $zipPath -Force
 
-                az functionapp deployment source config-zip `
+                Invoke-ZspAz functionapp deployment source config-zip `
                     --resource-group $config['RESOURCE_GROUP_NAME'] `
                     --name $config['FUNCTION_APP_NAME'] `
                     --src $zipPath `
@@ -593,7 +609,7 @@ if (-not $SkipTest) {
     Write-Host "Step 7/7: Running smoke test..." -ForegroundColor Cyan
 
     # Retrieve the function key for authenticated requests
-    $functionKey = az functionapp keys list `
+    $functionKey = Invoke-ZspAz functionapp keys list `
         --name $config['FUNCTION_APP_NAME'] `
         --resource-group $config['RESOURCE_GROUP_NAME'] `
         --query "functionKeys.default" -o tsv 2>$null
@@ -645,8 +661,17 @@ Write-Host "  Security Reader: $($config['SECURITY_READER_GROUP_ID'])"
 Write-Host ""
 Write-Host "Backup Service Principal: $($config['BACKUP_SP_OBJECT_ID'])"
 Write-Host ""
-Write-Host "Safe rerun (the manifest reuses these exact Entra IDs automatically):"
-$safeRerunCommand = "./scripts/Deploy-Lab.ps1 -ProjectName `"$ProjectName`" -ExpectedIntuneAdminGroupId `"$($config['INTUNE_ADMIN_GROUP_ID'])`" -ExpectedSecurityReaderGroupId `"$($config['SECURITY_READER_GROUP_ID'])`" -ExpectedBackupAppObjectId `"$($config['BACKUP_APP_OBJECT_ID'])`" -ExpectedBackupSpObjectId `"$($config['BACKUP_SP_OBJECT_ID'])`""
+Write-Host "Rerun command (review lifecycle migration requirements again before execution):"
+function ConvertTo-RerunLiteral { param([string]$Value) return "'" + $Value.Replace("'", "''") + "'" }
+$safeRerunCommand = './scripts/Deploy-Lab.ps1 -ConfirmLifecycleMigration' +
+    ' -ProjectName ' + (ConvertTo-RerunLiteral $ProjectName) +
+    ' -Location ' + (ConvertTo-RerunLiteral $Location) +
+    ' -MaxAccessDurationMinutes ' + $MaxAccessDurationMinutes +
+    ' -ManifestPath ' + (ConvertTo-RerunLiteral $deploymentManifestPath) +
+    ' -ExpectedIntuneAdminGroupId ' + (ConvertTo-RerunLiteral $config['INTUNE_ADMIN_GROUP_ID']) +
+    ' -ExpectedSecurityReaderGroupId ' + (ConvertTo-RerunLiteral $config['SECURITY_READER_GROUP_ID']) +
+    ' -ExpectedBackupAppObjectId ' + (ConvertTo-RerunLiteral $config['BACKUP_APP_OBJECT_ID']) +
+    ' -ExpectedBackupSpObjectId ' + (ConvertTo-RerunLiteral $config['BACKUP_SP_OBJECT_ID'])
 Write-Host $safeRerunCommand -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "Test NHI access with:"

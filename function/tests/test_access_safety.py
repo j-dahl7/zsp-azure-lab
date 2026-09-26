@@ -21,6 +21,8 @@ from access_safety import (  # noqa: E402
     validate_admin_request,
     validate_duration,
     validate_nhi_request,
+    validate_scope,
+    scope_is_within,
 )
 
 
@@ -129,6 +131,24 @@ class RequestValidationTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(RequestValidationError):
                     validate_duration(value, 480)
+
+    def test_scope_authorization_rejects_ambiguous_path_components(self):
+        for suffix in ('/..', '/.', '/child/../other', '/%2e%2e', '/.%2E', '/child%2fother', '/a b', '/a\tb', '/a\x7fb'):
+            value = SCOPE + suffix
+            with self.subTest(suffix=suffix):
+                with self.assertRaises(RequestValidationError):
+                    validate_scope(value)
+                self.assertFalse(scope_is_within(value, SCOPE))
+                self.assertFalse(scope_is_within(SCOPE, value))
+
+    def test_scope_authorization_uses_complete_segments_and_preserves_unicode(self):
+        self.assertTrue(scope_is_within(SCOPE.upper(), SCOPE))
+        self.assertTrue(scope_is_within(SCOPE + '/secrets/example', SCOPE))
+        self.assertFalse(scope_is_within(SCOPE + '-sibling', SCOPE))
+        self.assertFalse(scope_is_within(SCOPE.rsplit('/providers/', 1)[0], SCOPE))
+        unicode_scope = SCOPE.replace('rg-zsp', 'rg-zsp-\u00df')
+        self.assertTrue(scope_is_within(unicode_scope + '/secrets/example', unicode_scope))
+        self.assertFalse(scope_is_within(unicode_scope.replace('\u00df', 'ss'), unicode_scope))
 
     def test_duration_accepts_policy_boundaries(self):
         self.assertEqual(validate_duration(1, 480), 1)

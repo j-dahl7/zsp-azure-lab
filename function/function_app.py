@@ -40,6 +40,7 @@ from access_safety import (
     validate_admin_request,
     validate_duration,
     validate_nhi_request,
+    scope_is_within,
 )
 
 app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -158,9 +159,7 @@ def _scope_is_allowed(scope: str) -> bool:
     if not allowed_scopes:
         return False
 
-    normalized = scope.rstrip('/').casefold()
-    return any(normalized == allowed.rstrip('/').casefold() or
-               normalized.startswith(f"{allowed.rstrip('/').casefold()}/") for allowed in allowed_scopes)
+    return any(scope_is_within(scope, allowed) for allowed in allowed_scopes)
 
 
 def _nhi_roles_allowed() -> set[str]:
@@ -551,7 +550,7 @@ async def nhi_access_request(req: func.HttpRequest, client) -> func.HttpResponse
 async def backup_job_access_grant(timer: func.TimerRequest, client):
     """
     Grant backup service principal access before the nightly job runs.
-    Triggered by schedule (default: 1:55 AM daily).
+    Triggered by schedule (default: 01:55 UTC daily).
     """
     logging.info("Backup job access grant triggered")
 
