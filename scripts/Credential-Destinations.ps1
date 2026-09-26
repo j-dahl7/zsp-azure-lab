@@ -1,3 +1,5 @@
+#Requires -Version 7.6
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 # Read-only validation shared by deployment configuration and smoke-test clients.
 # Public Azure only. No credential-bearing request follows a redirect.
 function Get-StrictHttpsOrigin {
@@ -16,7 +18,7 @@ function Get-StrictHttpsOrigin {
 function Read-AzureMetadata {
     param([Parameter(Mandatory)][string[]]$Arguments)
     $global:LASTEXITCODE = 0
-    $raw = & az @Arguments --output json 2>$null
+    $raw = Invoke-ZspAz @Arguments --output json 2>$null
     if ($LASTEXITCODE -ne 0) { throw 'Azure metadata lookup failed; no application credential was sent.' }
     try { return ($raw | ConvertFrom-Json -ErrorAction Stop) }
     catch { throw 'Azure metadata was not valid JSON; no application credential was sent.' }

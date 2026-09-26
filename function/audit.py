@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from typing import Iterable, Mapping
 from security_boundaries import ingestion_endpoint, immutable_dcr_id
 
-from azure.identity import DefaultAzureCredential
+from azure.identity import ManagedIdentityCredential
+from client_lifecycle import in_worker_thread
 from azure.monitor.ingestion import LogsIngestionClient
 
 
@@ -64,7 +65,8 @@ def require_audit_configuration() -> tuple[str, str]:
     return status["endpoint"], status["rule_id"]
 
 
-async def log_access_event(
+@in_worker_thread
+def log_access_event(
     event_type: str,
     identity_type: str,
     principal_id: str,
@@ -107,41 +109,36 @@ async def log_access_event(
     dcr_endpoint, dcr_rule_id = require_audit_configuration()
 
     try:
-        credential = DefaultAzureCredential()
-        client = LogsIngestionClient(
-            endpoint=dcr_endpoint,
-            credential=credential,
-            redirect_total=0,
-        )
+        with ManagedIdentityCredential() as credential:
+            with LogsIngestionClient(endpoint=dcr_endpoint, credential=credential, permit_redirects=False) as client:
+                log_entry = {
+                    "TimeGenerated": datetime.now(timezone.utc).isoformat(),
+                    "EventType": event_type,
+                    "IdentityType": identity_type,
+                    "PrincipalId": principal_id,
+                    "PrincipalName": "",  # Could be enriched with display name
+                    "Target": target,
+                    "TargetType": target_type,
+                    "Role": role or "",
+                    "DurationMinutes": duration_minutes or 0,
+                    "Justification": justification or "",
+                    "TicketId": ticket_id or "",
+                    "WorkflowId": workflow_id or "",
+                    "LifecycleId": lifecycle_id or "",
+                    "EntitlementId": entitlement_id or "",
+                    "ExpiresAt": expires_at or "",
+                    "RequestedBy": requested_by or "",
+                    "Result": result,
+                    "ErrorMessage": error_message or ""
+                }
 
-        log_entry = {
-            "TimeGenerated": datetime.now(timezone.utc).isoformat(),
-            "EventType": event_type,
-            "IdentityType": identity_type,
-            "PrincipalId": principal_id,
-            "PrincipalName": "",  # Could be enriched with display name
-            "Target": target,
-            "TargetType": target_type,
-            "Role": role or "",
-            "DurationMinutes": duration_minutes or 0,
-            "Justification": justification or "",
-            "TicketId": ticket_id or "",
-            "WorkflowId": workflow_id or "",
-            "LifecycleId": lifecycle_id or "",
-            "EntitlementId": entitlement_id or "",
-            "ExpiresAt": expires_at or "",
-            "RequestedBy": requested_by or "",
-            "Result": result,
-            "ErrorMessage": error_message or ""
-        }
+                client.upload(
+                    rule_id=dcr_rule_id,
+                    stream_name="Custom-ZSPAudit_CL",
+                    logs=[log_entry]
+                )
 
-        client.upload(
-            rule_id=dcr_rule_id,
-            stream_name="Custom-ZSPAudit_CL",
-            logs=[log_entry]
-        )
-
-        logging.info(f"Audit log sent: {event_type} for {principal_id}")
+                logging.info(f"Audit log sent: {event_type} for {principal_id}")
 
     except Exception as e:
         # The custom table is the only record a grant leaves behind, so a

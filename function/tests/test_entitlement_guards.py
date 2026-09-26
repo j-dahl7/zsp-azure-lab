@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+import threading
 import unittest
 from pathlib import Path
 
@@ -343,6 +344,7 @@ class FakeRoleAssignments:
                     f"{role_assignment_name}"
                 ),
                 "name": role_assignment_name,
+                "scope": scope,
             },
         )()
 
@@ -358,6 +360,40 @@ class FakeAuthorizationClient:
 
 
 class NhiEntitlementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_arm_pager_runs_off_the_async_worker_event_loop(self):
+        class ThreadRecordingAssignments(FakeRoleAssignments):
+            def list_for_scope(self, **kwargs):
+                self.thread = threading.get_ident()
+                return super().list_for_scope(**kwargs)
+        assignments = ThreadRecordingAssignments()
+        await ensure_nhi_entitlement_absent(SP_ID, SCOPE, 'Reader', auth_client=FakeAuthorizationClient(assignments))
+        self.assertNotEqual(assignments.thread, threading.get_ident())
+
+    async def test_response_scope_mismatch_never_deletes_an_arbitrary_returned_id(self):
+        class WrongScopeAssignments(FakeRoleAssignments):
+            def create(self, **kwargs):
+                result = super().create(**kwargs)
+                result.scope = SCOPE.rsplit('/providers/', 1)[0]
+                result.id = result.scope + '/providers/Microsoft.Authorization/roleAssignments/55555555-5555-4555-8555-555555555555'
+                return result
+
+        assignments = WrongScopeAssignments()
+        with self.assertRaisesRegex(PermissionError, 'admitted scope'):
+            await grant_nhi_access(SP_ID, SCOPE, 'Reader', 30, 'manual-test', auth_client=FakeAuthorizationClient(assignments))
+        self.assertEqual(assignments.create_calls, 1)
+        self.assertEqual(assignments.delete_calls, 0)
+
+    async def test_missing_response_scope_is_not_treated_as_proof(self):
+        class MissingScopeAssignments(FakeRoleAssignments):
+            def create(self, **kwargs):
+                result = super().create(**kwargs)
+                result.scope = None
+                return result
+        assignments = MissingScopeAssignments()
+        with self.assertRaisesRegex(PermissionError, 'admitted scope'):
+            await grant_nhi_access(SP_ID, SCOPE, 'Reader', 30, 'manual-test', auth_client=FakeAuthorizationClient(assignments))
+        self.assertEqual(assignments.delete_calls, 0)
+
     async def test_preexisting_matching_role_assignment_is_rejected(self):
         role_definition_id = (
             f"/subscriptions/{SUBSCRIPTION_ID}/providers/"

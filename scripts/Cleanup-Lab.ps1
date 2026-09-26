@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Safely removes resources recorded by a ZSP lab deployment.
@@ -26,6 +26,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 $PSNativeCommandUseErrorActionPreference = $false
 $OwnerMarker = 'nine-lives-zsp:azure:v1'
 $OwnerTag = 'nlzt-owner'
@@ -59,7 +60,7 @@ function Get-GraphObjectByExactId {
 
     $encodedFilter = [System.Uri]::EscapeDataString("id eq '$ObjectId'")
     $encodedSelect = [System.Uri]::EscapeDataString($Select)
-    $responseJson = az rest --method GET `
+    $responseJson = Invoke-ZspAz rest --method GET `
         --url "https://graph.microsoft.com/v1.0/$EntitySet?`$filter=$encodedFilter&`$select=$encodedSelect" `
         --output json
     $lookupExitCode = $LASTEXITCODE
@@ -100,7 +101,7 @@ function Assert-OwnedGroup {
         throw "Group '$ObjectId' does not carry this deployment's provenance marker."
     }
 
-    $membersJson = az rest --method GET `
+    $membersJson = Invoke-ZspAz rest --method GET `
         --url "https://graph.microsoft.com/v1.0/groups/$ObjectId/members?`$select=id&`$top=1" `
         --output json
     $memberExitCode = $LASTEXITCODE
@@ -189,7 +190,7 @@ if ([string]$manifest.status -notin @('planned', 'azure_deployed') -and
     throw "Cleanup manifest state '$($manifest.status)' must contain the full Entra identity set."
 }
 
-$accountJson = az account show --output json
+$accountJson = Invoke-ZspAz account show --output json
 $accountExitCode = $LASTEXITCODE
 Assert-AzSucceeded -ExitCode $accountExitCode -Operation 'Read active Azure account'
 try {
@@ -206,7 +207,7 @@ if (-not [string]::Equals([string]$account.id, [string]$manifest.subscription_id
 }
 
 # Azure ownership is verified before any Graph or Azure deletion.
-$existsText = az group exists `
+$existsText = Invoke-ZspAz group exists `
     --subscription $manifest.subscription_id `
     --name $manifest.resource_group_name `
     --output tsv
@@ -218,7 +219,7 @@ $resourceGroupExists = switch (([string]$existsText).Trim().ToLowerInvariant()) 
     default { throw "Azure returned an invalid existence result for resource group '$($manifest.resource_group_name)'." }
 }
 if ($resourceGroupExists) {
-    $resourceGroupJson = az group show `
+    $resourceGroupJson = Invoke-ZspAz group show `
         --subscription $manifest.subscription_id `
         --name $manifest.resource_group_name `
         --output json
@@ -332,7 +333,7 @@ if ($WhatIfPreference) {
 $deleteDeclined = $false
 foreach ($target in $targets) {
     if ($PSCmdlet.ShouldProcess("$($target.Type) $($target.Id)", 'Delete exact provenance-verified Entra object')) {
-        az rest --method DELETE --url $target.Url --output none
+        Invoke-ZspAz rest --method DELETE --url $target.Url --output none
         $deleteExitCode = $LASTEXITCODE
         Assert-AzSucceeded -ExitCode $deleteExitCode -Operation "Delete exact $($target.Type) '$($target.Id)'"
     }
@@ -369,7 +370,7 @@ if ($DestroyAzureResources -and $resourceGroupExists) {
     if (-not $PSCmdlet.ShouldProcess($expectedResourceGroupId, 'Delete exact owner-tagged ZSP lab resource group')) {
         throw 'Azure resource-group deletion was declined. The manifest was retained.'
     }
-    az group delete `
+    Invoke-ZspAz group delete `
         --subscription $manifest.subscription_id `
         --name $manifest.resource_group_name `
         --yes `
@@ -381,7 +382,8 @@ if ($DestroyAzureResources -and $resourceGroupExists) {
 }
 
 if ($resourceGroupExists) {
-    Write-Host 'Exact Entra cleanup completed. The owner-tagged Azure resource group and manifest were retained.' -ForegroundColor Green
+    Write-Warning 'Exact Entra cleanup completed, but the Function managed identity, its tenant-wide Graph grants (including Tier 0 role-management rights), Azure RBAC, and billable resources remain. Review -DestroyAzureResources for full owned-resource cleanup.'
+    Write-Host 'The owner-tagged Azure resource group and recovery manifest were retained.' -ForegroundColor Yellow
     return
 }
 

@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Creates Entra ID objects for Zero Standing Privilege lab.
@@ -74,6 +74,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 
 # Helper: Write JSON to temp file for cross-platform az rest compatibility
 # Avoids PS 7.0-7.2 Windows bug where double quotes are stripped from native command args
@@ -102,13 +103,13 @@ function Wait-ForObject {
         try {
             switch ($ObjectType) {
                 'group' {
-                    $result = az ad group show --group $ObjectId --output json 2>$null | ConvertFrom-Json
+                    $result = Invoke-ZspAz ad group show --group $ObjectId --output json 2>$null | ConvertFrom-Json
                 }
                 'sp' {
-                    $result = az ad sp show --id $ObjectId --output json 2>$null | ConvertFrom-Json
+                    $result = Invoke-ZspAz ad sp show --id $ObjectId --output json 2>$null | ConvertFrom-Json
                 }
                 'app' {
-                    $result = az ad app show --id $ObjectId --output json 2>$null | ConvertFrom-Json
+                    $result = Invoke-ZspAz ad app show --id $ObjectId --output json 2>$null | ConvertFrom-Json
                 }
             }
             if ($result) {
@@ -206,17 +207,17 @@ function Get-DirectoryObjectsByDisplayName {
     switch ($DirectoryObjectType) {
         'group' {
             $results = @(
-                az ad group list --display-name $DisplayName --output json 2>$null | ConvertFrom-Json
+                Invoke-ZspAz ad group list --display-name $DisplayName --output json 2>$null | ConvertFrom-Json
             )
         }
         'application' {
             $results = @(
-                az ad app list --display-name $DisplayName --all --output json 2>$null | ConvertFrom-Json
+                Invoke-ZspAz ad app list --display-name $DisplayName --all --output json 2>$null | ConvertFrom-Json
             )
         }
         'servicePrincipal' {
             $results = @(
-                az ad sp list --display-name $DisplayName --all --output json 2>$null | ConvertFrom-Json
+                Invoke-ZspAz ad sp list --display-name $DisplayName --all --output json 2>$null | ConvertFrom-Json
             )
         }
     }
@@ -291,7 +292,7 @@ function Get-GraphDirectoryObject {
         [string]$Select
     )
 
-    $result = az rest --method GET `
+    $result = Invoke-ZspAz rest --method GET `
         --uri "https://graph.microsoft.com/v1.0/$Collection/${ObjectId}?`$select=$Select" `
         --output json 2>$null | ConvertFrom-Json
     $exitCode = $LASTEXITCODE
@@ -364,7 +365,7 @@ function Assert-ZspGroupHasNoDirectMembers {
         [Parameter(Mandatory)][string]$DisplayName
     )
 
-    $membershipResponse = az rest --method GET `
+    $membershipResponse = Invoke-ZspAz rest --method GET `
         --uri "https://graph.microsoft.com/v1.0/groups/${ObjectId}/members?`$select=id&`$top=1" `
         --output json 2>$null | ConvertFrom-Json
     $exitCode = $LASTEXITCODE
@@ -561,7 +562,7 @@ else {
         isAssignableToRole = $true
     } | ConvertTo-Json -Compress
 
-    $intuneGroup = az rest --method POST `
+    $intuneGroup = Invoke-ZspAz rest --method POST `
         --uri "https://graph.microsoft.com/v1.0/groups" `
         --headers "Content-Type=application/json" `
         --body (New-JsonBodyFile $groupBody) `
@@ -606,7 +607,7 @@ else {
         isAssignableToRole = $true
     } | ConvertTo-Json -Compress
 
-    $securityGroup = az rest --method POST `
+    $securityGroup = Invoke-ZspAz rest --method POST `
         --uri "https://graph.microsoft.com/v1.0/groups" `
         --headers "Content-Type=application/json" `
         --body (New-JsonBodyFile $groupBody) `
@@ -645,14 +646,14 @@ Assert-ZspGroupHasNoDirectMembers -ObjectId $securityGroupId -DisplayName $secur
 
 # Activate and assign Intune Administrator role
 Write-Host "  Activating Intune Administrator role..." -ForegroundColor Cyan
-$intuneRole = az rest --method GET `
+$intuneRole = Invoke-ZspAz rest --method GET `
     --uri "https://graph.microsoft.com/v1.0/directoryRoles?`$filter=roleTemplateId eq '$IntuneAdminRoleTemplateId'" `
     --output json 2>$null | ConvertFrom-Json
 
 if (-not $intuneRole.value -or $intuneRole.value.Count -eq 0) {
     # Activate the role
     $activateBody = @{ roleTemplateId = $IntuneAdminRoleTemplateId } | ConvertTo-Json -Compress
-    $intuneRole = az rest --method POST `
+    $intuneRole = Invoke-ZspAz rest --method POST `
         --uri "https://graph.microsoft.com/v1.0/directoryRoles" `
         --headers "Content-Type=application/json" `
         --body (New-JsonBodyFile $activateBody) `
@@ -671,7 +672,7 @@ else {
 
 # Assign group to Intune Administrator role
 Write-Host "  Assigning group to Intune Administrator role..." -ForegroundColor Cyan
-$existingIntuneMember = az rest --method GET `
+$existingIntuneMember = Invoke-ZspAz rest --method GET `
     --uri "https://graph.microsoft.com/v1.0/directoryRoles/$intuneRoleId/members?`$select=id" `
     --output json 2>$null | ConvertFrom-Json
 $intuneMemberLookupExitCode = $LASTEXITCODE
@@ -696,7 +697,7 @@ $existingIntuneMember = @(
 )
 if ($existingIntuneMember.Count -eq 0) {
     $memberBody = @{ "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$intuneGroupId" } | ConvertTo-Json -Compress
-    az rest --method POST `
+    Invoke-ZspAz rest --method POST `
         --uri "https://graph.microsoft.com/v1.0/directoryRoles/$intuneRoleId/members/`$ref" `
         --headers "Content-Type=application/json" `
         --body (New-JsonBodyFile $memberBody) `
@@ -713,14 +714,14 @@ else {
 
 # Activate and assign Security Reader role
 Write-Host "  Activating Security Reader role..." -ForegroundColor Cyan
-$securityRole = az rest --method GET `
+$securityRole = Invoke-ZspAz rest --method GET `
     --uri "https://graph.microsoft.com/v1.0/directoryRoles?`$filter=roleTemplateId eq '$SecurityReaderRoleTemplateId'" `
     --output json 2>$null | ConvertFrom-Json
 
 if (-not $securityRole.value -or $securityRole.value.Count -eq 0) {
     # Activate the role
     $activateBody = @{ roleTemplateId = $SecurityReaderRoleTemplateId } | ConvertTo-Json -Compress
-    $securityRole = az rest --method POST `
+    $securityRole = Invoke-ZspAz rest --method POST `
         --uri "https://graph.microsoft.com/v1.0/directoryRoles" `
         --headers "Content-Type=application/json" `
         --body (New-JsonBodyFile $activateBody) `
@@ -739,7 +740,7 @@ else {
 
 # Assign group to Security Reader role
 Write-Host "  Assigning group to Security Reader role..." -ForegroundColor Cyan
-$existingSecurityMember = az rest --method GET `
+$existingSecurityMember = Invoke-ZspAz rest --method GET `
     --uri "https://graph.microsoft.com/v1.0/directoryRoles/$securityRoleId/members?`$select=id" `
     --output json 2>$null | ConvertFrom-Json
 $securityMemberLookupExitCode = $LASTEXITCODE
@@ -764,7 +765,7 @@ $existingSecurityMember = @(
 )
 if ($existingSecurityMember.Count -eq 0) {
     $memberBody = @{ "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$securityGroupId" } | ConvertTo-Json -Compress
-    az rest --method POST `
+    Invoke-ZspAz rest --method POST `
         --uri "https://graph.microsoft.com/v1.0/directoryRoles/$securityRoleId/members/`$ref" `
         --headers "Content-Type=application/json" `
         --body (New-JsonBodyFile $memberBody) `
@@ -796,7 +797,7 @@ else {
         tags = @($provenanceTag)
     } | ConvertTo-Json -Depth 4 -Compress
 
-    $backupApp = az rest --method POST `
+    $backupApp = Invoke-ZspAz rest --method POST `
         --uri 'https://graph.microsoft.com/v1.0/applications' `
         --headers 'Content-Type=application/json' `
         --body (New-JsonBodyFile $applicationBody) `
@@ -843,7 +844,7 @@ else {
     # Only appId is required. Provenance is established by the immutable appId
     # link to the application object verified above.
     $servicePrincipalBody = @{ appId = $backupAppId } | ConvertTo-Json -Compress
-    $backupSp = az rest --method POST `
+    $backupSp = Invoke-ZspAz rest --method POST `
         --uri 'https://graph.microsoft.com/v1.0/servicePrincipals' `
         --headers 'Content-Type=application/json' `
         --body (New-JsonBodyFile $servicePrincipalBody) `

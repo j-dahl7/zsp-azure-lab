@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Deploys provenance-bound Azure infrastructure using Bicep.
@@ -14,7 +14,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidatePattern('^[a-z0-9-]+$')]
+    [ValidatePattern('^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$')]
     [ValidateLength(3, 20)]
     [string]$ProjectName,
 
@@ -34,6 +34,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Azure-Cli.ps1')
 $PSNativeCommandUseErrorActionPreference = $false
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BicepDir = Join-Path (Split-Path -Parent $ScriptDir) 'bicep'
@@ -153,12 +154,13 @@ function Write-DeploymentManifest {
         subscription_id      = $subscriptionId
         resource_group_name  = $resourceGroupName
         resource_group_id    = $expectedResourceGroupId
+        max_access_duration_minutes = $MaxAccessDurationMinutes
     }
 
     $entraFields = @(
         'intune_admin_group_id', 'security_reader_group_id',
         'backup_app_object_id', 'backup_service_principal_id',
-        'backup_service_principal_app_id'
+        'backup_service_principal_app_id', 'function_app_id', 'function_app_principal_id'
     )
     if ($ExistingManifest) {
         foreach ($field in $entraFields) {
@@ -191,7 +193,7 @@ function Get-VerifiedResourceGroup {
         [Parameter(Mandatory)][string]$ExpectedResourceGroupId
     )
 
-    $resourceGroupJson = az group show `
+    $resourceGroupJson = Invoke-ZspAz group show `
         --subscription $subscriptionId `
         --name $resourceGroupName `
         --output json 2>$null
@@ -218,7 +220,7 @@ function Get-VerifiedResourceGroup {
 }
 
 Write-Host 'Reading Azure account and resource-group ownership state...' -ForegroundColor Yellow
-$accountJson = az account show --output json 2>$null
+$accountJson = Invoke-ZspAz account show --output json 2>$null
 $accountExitCode = $LASTEXITCODE
 Assert-AzSucceeded -ExitCode $accountExitCode -Operation 'Read active Azure account'
 try {
@@ -236,7 +238,7 @@ $tenantId = [string]$account.tenantId
 $resourceGroupName = "$ProjectName-rg"
 $expectedResourceGroupId = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroupName"
 
-$existsText = az group exists `
+$existsText = Invoke-ZspAz group exists `
     --subscription $subscriptionId `
     --name $resourceGroupName `
     --output tsv 2>$null
@@ -288,7 +290,7 @@ else {
 Write-Host 'Deploying Azure resources...' -ForegroundColor Yellow
 $deploymentToken = $deploymentId.Replace('-', '').Substring(0, 12)
 $deploymentName = "zsp-$ProjectName-$deploymentToken"
-$deploymentJson = az deployment sub create `
+$deploymentJson = Invoke-ZspAz deployment sub create `
     --name $deploymentName `
     --subscription $subscriptionId `
     --location $Location `

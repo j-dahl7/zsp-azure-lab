@@ -20,7 +20,7 @@
     },
     "durableTask": {
       "storageProvider": {
-        "connectionStringName": "AzureWebJobsStorage"
+        "connectionName": "AzureWebJobsStorage"
       }
     }
   },

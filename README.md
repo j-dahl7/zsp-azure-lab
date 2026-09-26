@@ -4,7 +4,7 @@
 
 > **Companion repo for the blog post: [Just-In-Time Access for AI Agents: Building a ZSP Gateway in Azure](https://nineliveszerotrust.com/blog/zero-standing-privilege-azure/)**
 
-A serverless gateway that grants time-bounded Azure permissions to AI agents, automation workflows, and service principals. Implements the **Zero Standing Privilege** pattern - identities start with zero permissions and receive temporary access on demand.
+A serverless gateway that grants time-bounded Azure permissions to AI agents, automation workflows, and service principals. The target roles are absent until granted; unrelated baseline permissions can still exist. The gateway itself remains a privileged workload.
 
 ## Validation Boundary
 
@@ -17,6 +17,15 @@ for this revision. Treat the smoke test and API responses as runtime checks
 that must pass in your own tenant.
 
 ## Lifecycle v2 Migration — Required Before Deployment
+
+This repair also changes the runtime to Python 3.12 and migrates host/deployment
+storage from account keys to the Function's system-assigned identity. For an
+existing v2 app, pause admission and the backup timer and settle active grants
+before that configuration transition as well. Keep the same owned storage
+account and task hub; do not delete histories or queues as a migration step.
+Verify storage RBAC propagation, host startup, deployment-package access, audit
+ingestion, and exact revocation before reopening admission. Offline checks do
+not prove those tenant-specific outcomes.
 
 This release retires the registered `access_lifecycle_orchestrator` and
 `revocation_orchestrator` handlers and starts only
@@ -275,17 +284,17 @@ before reuse. Older unmarked objects are not auto-adopted.
 
 Azure Functions remote build reads `function/requirements.txt`, which enables
 pip hash-checking and includes `function/pins.txt`. The pins file locks all 55
-resolved Python 3.11 packages and their distribution hashes. CI installs the
+resolved Python 3.12 packages and their distribution hashes. CI installs the
 same manifest with `--require-hashes` before tests. Edit direct requirements
 only in `function/requirements.in`, then regenerate the pins with:
 
 ```bash
-uv pip compile --python-version 3.11 --universal --generate-hashes \
+uv pip compile --python-version 3.12 --universal --generate-hashes \
   function/requirements.in -o function/pins.txt
 ```
 
 The `.txt` extension lets Dependabot follow the nested pins file, while
-`function/.python-version` keeps its resolver on the same Python 3.11 line as
+`function/.python-version` keeps its resolver on the same Python 3.12 line as
 Azure Functions and CI.
 
 Function publishing excludes `local.settings.json`, virtual environments,
@@ -422,9 +431,9 @@ zsp-azure-lab/
 │   ├── nhi_access.py         # NHI ZSP logic
 │   ├── admin_access.py       # Human ZSP logic
 │   ├── audit.py              # Logging utilities
-│   ├── .python-version       # Dependabot/pyenv Python 3.11 selection
+│   ├── .python-version       # Dependabot/pyenv Python 3.12 selection
 │   ├── requirements.in       # Direct dependency constraints
-│   ├── pins.txt              # Python 3.11 transitive pins + hashes
+│   ├── pins.txt              # Python 3.12 transitive pins + hashes
 │   ├── requirements.txt      # Remote-build hash-lock entry point
 │   └── host.json
 └── .github/workflows/
@@ -450,6 +459,95 @@ IDs. Requests outside those allowlists are rejected.
 ---
 
 ## Admin Lifecycle Ownership and Recovery
+
+### Canonical scope and permission migration
+
+Resource scopes must use canonical, unescaped ARM IDs. The gateway rejects dot
+path components, percent escapes, query/fragment text, backslashes, control
+characters, and whitespace before admission and again during activity policy
+checks. Allowed targets are compared by complete path segments; child resources
+remain allowed, while similarly prefixed sibling names do not. ASCII casing is
+ignored; use the exact non-ASCII resource-name spelling from the configured ID.
+Role-assignment responses must carry the expected complete ID and scope. An
+unexpected response does not authorize deletion of its returned ID; compensation
+uses only the lifecycle's pre-recorded deterministic assignment ID.
+
+The audit client now uses the SDK's supported `permit_redirects=False` setting.
+Its in-memory SDK probe verifies that a redirect does not produce a second
+transport request. This is offline contract validation, not a live DCR test.
+
+Earlier revisions labelled application permission
+`62a82d76-70ea-41e2-9197-370581804d09` as GroupMember.ReadWrite.All, but it is
+**Group.ReadWrite.All**. The corrected membership permission is
+`dbaae8cf-10b5-4b86-a4a1-f871c94c6695`. New deployments also omit the unnecessary
+Directory.Read.All grant. Updating code does not automatically remove grants
+already present in an existing tenant. The grant script reports legacy broad
+assignments for review; verify the identity has no other consumer relying on
+them, then supply their exact Graph assignment IDs to the migration helper:
+
+```powershell
+# Substitute the exact Function managed-identity object ID and reviewed Graph
+# appRoleAssignment IDs printed by Grant-Permissions.ps1.
+./scripts/Remove-LegacyGraphGrants.ps1 -FunctionAppPrincipalId '<object-guid>' `
+  -AssignmentIds @('<reviewed-assignment-id>') -WhatIf
+# Remove -WhatIf only after reviewing the exact selected legacy assignments.
+```
+
+The helper preflights all selected IDs before deleting anything and rechecks each
+one. It refuses other principals, resources, and roles. It does not remove the
+separately required RoleManagement.ReadWrite.Directory permission or make this
+Tier 0 workload unprivileged. No cloud grant removal was performed as part of
+the source repair.
+
+### Runtime and deployment maintenance
+
+Python 3.12 is selected consistently by the Function template, resolver marker,
+CI and regenerated hash lock. Full SDK installation/import is checked on the
+Linux CI runner. The generated Graph SDK contains paths longer than the default
+Windows path limit; a local Windows installation needs long-path support or an
+equivalent verified environment. The source repair does not change OS settings.
+
+ARM and audit operations run in worker threads rather than blocking the shared
+async event loop. Graph uses an asynchronous managed-identity credential. Owned
+SDK credentials and HTTP clients are closed after each operation; injected test
+clients remain the caller's responsibility. This favors explicit lifetime and
+identity boundaries over a cross-event-loop singleton.
+
+Host and Flex deployment storage now use system-assigned identity. The host
+receives Blob Data Owner plus Queue/Table Data Contributor on its exact storage
+account; Durable uses the same `AzureWebJobsStorage` identity prefix. The two
+legacy connection-string settings are removed after template deployment because
+an exact setting would override that prefix. Shared-key authorization is disabled
+on both host and target storage. These are source/configuration changes, not a
+claim that an existing tenant has already migrated.
+
+Key Vault control-plane resources use API `2026-02-01` with RBAC explicitly
+enabled. New templates no longer add a standing Key Vault Administrator grant
+to the deployer. Incremental deployments do not automatically delete that older
+assignment: inspect its exact ID, principal and consumers before removing it.
+The deployment name remains deterministic, and soft-deleted vault names remain
+reserved during retention. Use an explicitly reviewed recovery or a different
+project name; cleanup never purges a vault automatically. Project names must
+start with a lowercase letter and cannot contain adjacent or trailing hyphens.
+
+The manifest records the access-duration policy and exact Function identity.
+Reruns preserve the recorded maximum duration unless explicitly changed and
+print a command with the location, manifest path, duration and required migration
+acknowledgement. The default backup schedule is **01:55 UTC**, not local time.
+
+PowerShell entry points require 7.6. The CLI adapter separates stdout JSON from
+diagnostics and preserves native arguments on Windows. Failure warnings include
+bounded provider codes without echoing bodies or credentials; permission retry
+loops retry only recognized transient failures. Default cleanup explicitly warns
+that the live Function identity and its Tier 0 grants remain unless full owned
+Azure-resource cleanup is requested.
+
+The remaining group-scoped User Access Administrator delegation and legacy
+directory-role API are deliberate compatibility boundaries, not newly claimed
+least-privilege production architecture. For production, design resource-scoped
+conditional delegation and unified role assignments together with exact-grant
+migration. Do not replace them piecemeal or assume that narrowing Azure RBAC
+removes the gateway's separate tenant-wide Graph privilege.
 
 A Durable Entity serializes ownership of each user/group membership. Only the
 lifecycle that claimed that entity may revoke the membership it created.

@@ -109,7 +109,7 @@ class ZspStaticSafetyTests(unittest.TestCase):
         entrypoint = REQUIREMENTS.read_text(encoding="utf-8").splitlines()
         self.assertIn("--require-hashes", entrypoint)
         self.assertIn("-r pins.txt", entrypoint)
-        self.assertEqual(PYTHON_VERSION.read_text(encoding="utf-8").strip(), "3.11")
+        self.assertEqual(PYTHON_VERSION.read_text(encoding="utf-8").strip(), "3.12")
         lock = PINS.read_text(encoding="utf-8")
         for package in (
             "azure-functions==",
@@ -405,21 +405,26 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
             wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
 
     def _run_pwsh(self, script: Path, *arguments: str, **extra_env: str) -> subprocess.CompletedProcess:
+        def quote(value):
+            return "'" + str(value).replace("'", "''") + "'"
+        tokens = []
+        for arg in arguments:
+            if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*(?::\$(?:true|false))?", arg, re.IGNORECASE):
+                tokens.append(arg)
+            else:
+                tokens.append(quote(arg))
+        harness = self.bin_dir / 'invoke-fixture.ps1'
+        harness.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "function global:az { & $env:ZSP_FIXTURE_PYTHON $env:ZSP_FIXTURE_AZ @args }\n"
+            "& $env:ZSP_FIXTURE_SCRIPT " + ' '.join(tokens) + "\nexit $LASTEXITCODE\n",
+            encoding='utf-8',
+        )
         return subprocess.run(
-            [
-                "pwsh",
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-File",
-                str(script),
-                *arguments,
-            ],
-            env={**self.env, **extra_env},
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
+            ['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', str(harness)],
+            env={**self.env, **extra_env, 'ZSP_FIXTURE_PYTHON': sys.executable,
+                 'ZSP_FIXTURE_AZ': str(self.bin_dir / 'az_impl.py'), 'ZSP_FIXTURE_SCRIPT': str(script)},
+            capture_output=True, text=True, timeout=60, check=False,
         )
 
     def _deploy_azure(self, **extra_env: str) -> subprocess.CompletedProcess:
@@ -613,6 +618,7 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
         scripts = lab / "scripts"
         scripts.mkdir(parents=True)
         shutil.copy2(DEPLOY_LAB, scripts / "Deploy-Lab.ps1")
+        shutil.copy2(LAB_ROOT / 'scripts' / 'Azure-Cli.ps1', scripts / 'Azure-Cli.ps1')
 
         deployment_id = "66666666-6666-4666-8666-666666666666"
         intune_group = "77777777-7777-4777-8777-777777777777"

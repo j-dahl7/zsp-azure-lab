@@ -37,6 +37,7 @@ resource functionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   properties: {
     minimumTlsVersion: 'TLS1_2'
     allowBlobPublicAccess: false
+    allowSharedKeyAccess: false
     supportsHttpsTrafficOnly: true
   }
 }
@@ -101,8 +102,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
           type: 'blobContainer'
           value: '${functionStorage.properties.primaryEndpoints.blob}deployments'
           authentication: {
-            type: 'StorageAccountConnectionString'
-            storageAccountConnectionStringName: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
+            type: 'SystemAssignedIdentity'
           }
         }
       }
@@ -112,18 +112,26 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
       }
       runtime: {
         name: 'python'
-        version: '3.11'
+        version: '3.12'
       }
     }
     siteConfig: {
       appSettings: [
         {
-          name: 'AzureWebJobsStorage'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${functionStorage.name};EndpointSuffix=${environment().suffixes.storage};AccountKey=${functionStorage.listKeys().keys[0].value}'
+          name: 'AzureWebJobsStorage__credential'
+          value: 'managedidentity'
         }
         {
-          name: 'DEPLOYMENT_STORAGE_CONNECTION_STRING'
-          value: 'DefaultEndpointsProtocol=https;AccountName=${functionStorage.name};EndpointSuffix=${environment().suffixes.storage};AccountKey=${functionStorage.listKeys().keys[0].value}'
+          name: 'AzureWebJobsStorage__blobServiceUri'
+          value: functionStorage.properties.primaryEndpoints.blob
+        }
+        {
+          name: 'AzureWebJobsStorage__queueServiceUri'
+          value: functionStorage.properties.primaryEndpoints.queue
+        }
+        {
+          name: 'AzureWebJobsStorage__tableServiceUri'
+          value: functionStorage.properties.primaryEndpoints.table
         }
         {
           name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
@@ -140,6 +148,24 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
     deploymentContainer
   ]
 }
+
+// Functions host/timer requires Blob Data Owner. Durable additionally needs
+// Queue/Table Data Contributor; deployment-package reads are covered by the
+// blob role. These grants apply only to the exact owned host storage account.
+var hostStorageRoles = [
+  'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+  '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
+  '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+]
+resource hostStorageAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for roleId in hostStorageRoles: {
+  name: guid(functionStorage.id, functionApp.id, roleId)
+  scope: functionStorage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleId)
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
 
 // Outputs
 output functionAppId string = functionApp.id

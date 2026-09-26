@@ -82,13 +82,13 @@ class SetupEntraIdStaticContractTests(unittest.TestCase):
     def test_role_member_lookups_and_writes_check_native_exit_codes(self) -> None:
         operations = (
             (
-                "$existingIntuneMember = az rest --method GET",
+                "$existingIntuneMember = Invoke-ZspAz rest --method GET",
                 "$intuneMemberLookupExitCode = $LASTEXITCODE",
                 "$intuneMemberAssignmentExitCode = $LASTEXITCODE",
                 'Write-Host "    Assignment created" -ForegroundColor Green',
             ),
             (
-                "$existingSecurityMember = az rest --method GET",
+                "$existingSecurityMember = Invoke-ZspAz rest --method GET",
                 "$securityMemberLookupExitCode = $LASTEXITCODE",
                 "$securityMemberAssignmentExitCode = $LASTEXITCODE",
                 'Write-Host "    Assignment created" -ForegroundColor Green',
@@ -338,7 +338,6 @@ class GrantPermissionsStaticContractTests(unittest.TestCase):
     def test_every_permission_retry_loop_checks_the_native_exit_code(self) -> None:
         operations = (
             "grant GroupMember.ReadWrite.All",
-            "grant Directory.Read.All",
             "grant RoleManagement.ReadWrite.Directory",
             "grant User Access Administrator",
             "grant Monitoring Metrics Publisher",
