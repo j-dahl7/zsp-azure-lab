@@ -558,7 +558,7 @@ if (-not $SkipFunctionDeploy) {
             # Package only reviewed runtime files. Never upload gitignored local
             # settings, virtual environments, tests, caches, or arbitrary files.
             $deploymentFiles = @(
-                'access_safety.py', 'admin_access.py', 'audit.py',
+                'access_safety.py', 'admin_access.py', 'audit.py', 'client_lifecycle.py',
                 'function_app.py', 'nhi_access.py', 'security_boundaries.py', 'host.json',
                 'requirements.txt', 'pins.txt'
             )

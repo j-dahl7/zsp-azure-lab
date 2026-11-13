@@ -151,6 +151,21 @@ class ZspStaticSafetyTests(unittest.TestCase):
         for sensitive_path in ("local.settings.json", ".venv/", "venv/", "tests/", "*.pem", "*.key"):
             self.assertIn(sensitive_path, ignored)
 
+    def test_function_fallback_package_lists_every_runtime_module(self) -> None:
+        # The fallback used without Azure Functions Core Tools copies only the
+        # listed files. A module left out builds a package that cannot import.
+        deploy = DEPLOY_LAB.read_text(encoding="utf-8-sig")
+        block = re.search(r"\$deploymentFiles = @\((.*?)\)", deploy, re.DOTALL)
+        self.assertIsNotNone(block)
+        packaged = set(re.findall(r"'([^']+)'", block.group(1)))
+
+        function_dir = LAB_ROOT / "function"
+        runtime_modules = {path.name for path in function_dir.glob("*.py")}
+        self.assertIn("function_app.py", runtime_modules)
+        self.assertEqual(runtime_modules - packaged, set())
+        for name in sorted(packaged):
+            self.assertTrue((function_dir / name).is_file(), name)
+
     def test_deployed_audit_table_and_dcr_include_exact_correlation_columns(self) -> None:
         deploy = DEPLOY_LAB.read_text(encoding="utf-8-sig")
 
