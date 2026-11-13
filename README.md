@@ -159,7 +159,7 @@ learning how it works, start there.
 
 - Azure subscription with Owner access
 - Azure CLI configured (`az login`)
-- PowerShell 7+ (`pwsh`)
+- PowerShell 7.6 or later (`pwsh`); every script declares `#Requires -Version 7.6`
 - Entra ID P1 or P2 license (for group-based role assignment)
 - **Privileged Role Administrator** directory role (required to create role-assignable security groups)
 - Permission to create applications/service principals, grant the documented
