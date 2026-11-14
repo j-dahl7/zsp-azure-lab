@@ -1,4 +1,5 @@
 #Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Configures the Function App with Entra ID and Azure resource settings.

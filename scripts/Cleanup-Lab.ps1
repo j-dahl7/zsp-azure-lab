@@ -1,4 +1,5 @@
 #Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Safely removes resources recorded by a ZSP lab deployment.

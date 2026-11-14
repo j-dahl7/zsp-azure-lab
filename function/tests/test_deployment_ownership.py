@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 
@@ -34,6 +36,9 @@ PROJECT = "zsp-lab"
 RESOURCE_GROUP = f"{PROJECT}-rg"
 RESOURCE_GROUP_ID = f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP}"
 OWNER_MARKER = "nine-lives-zsp:azure:v1"
+STUB_FUNCTION_APP = "zsp-lab-gw-mock"
+STUB_BACKUP_SP = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+STUB_KEY_VAULT_ID = f"{RESOURCE_GROUP_ID}/providers/Microsoft.KeyVault/vaults/zsp-lab-kv"
 ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
@@ -41,6 +46,56 @@ def plain_process_output(result: subprocess.CompletedProcess) -> str:
     """Remove terminal styling and renderer-inserted line wrapping."""
     unstyled = ANSI_CONTROL_SEQUENCE.sub("", result.stderr + result.stdout)
     return " ".join(token for token in unstyled.split() if token != "|")
+
+
+class GatewayStandIn(http.server.BaseHTTPRequestHandler):
+    """Loopback copy of the admission and status responses in function_app.py."""
+
+    instance_id = "b10a200905204d0bb10d54fc4e1a73e0"
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def _record(self, body=None) -> bool:
+        key = self.headers.get("x-functions-key")
+        self.server.requests.append(
+            {"method": self.command, "path": self.path, "key": key, "body": body}
+        )
+        return key == self.server.function_key
+
+    def _reply(self, status: int, payload: dict) -> None:
+        content = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        authorized = self._record(json.loads(self.rfile.read(length) or b"null"))
+        if self.path != "/api/nhi-access" or not authorized:
+            self._reply(401, {"error": "unauthorized"})
+            return
+        origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+        status_uri = self.server.status_uri or f"{origin}/api/access-status/{self.instance_id}"
+        self._reply(202, {
+            "id": self.instance_id,
+            "status": "accepted",
+            "statusQueryGetUri": status_uri,
+        })
+
+    def do_GET(self) -> None:
+        # Like the real status route, a query string or a missing key is refused.
+        authorized = self._record()
+        if self.path != f"/api/access-status/{self.instance_id}" or not authorized:
+            self._reply(401, {"error": "unauthorized"})
+            return
+        self._reply(200, {
+            "id": self.instance_id,
+            "runtimeStatus": "Running",
+            "customStatus": {"status": "active", "grant_count": 1},
+        })
 
 
 class ZspStaticSafetyTests(unittest.TestCase):
@@ -628,7 +683,8 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
         self.assertIn("PASSED: Exact lifecycle-owned role assignment found", result.stdout)
         self.assertIn("Failed: 0", result.stdout)
 
-    def test_smoke_failure_never_emits_or_records_validated_completion(self) -> None:
+    def _write_stubbed_lab(self, *, function_app_url: str, smoke_test: str) -> Path:
+        """Put the real Deploy-Lab.ps1 beside offline stand-ins for its child scripts."""
         lab = self.root / "smoke-lab"
         scripts = lab / "scripts"
         scripts.mkdir(parents=True)
@@ -639,7 +695,7 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
         intune_group = "77777777-7777-4777-8777-777777777777"
         security_group = "88888888-8888-4888-8888-888888888888"
         backup_app = "99999999-9999-4999-8999-999999999999"
-        backup_sp = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        backup_sp = STUB_BACKUP_SP
         backup_client = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         rg_id = RESOURCE_GROUP_ID
 
@@ -664,11 +720,11 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
                 @(
                   'RESOURCE_GROUP_NAME={RESOURCE_GROUP}'
                   'RESOURCE_GROUP_ID={rg_id}'
-                  'FUNCTION_APP_NAME=zsp-lab-gw-mock'
-                  'FUNCTION_APP_ID={rg_id}/providers/Microsoft.Web/sites/zsp-lab-gw-mock'
-                  'FUNCTION_APP_URL=https://zsp-lab-gw-mock.azurewebsites.net'
+                  'FUNCTION_APP_NAME={STUB_FUNCTION_APP}'
+                  'FUNCTION_APP_ID={rg_id}/providers/Microsoft.Web/sites/{STUB_FUNCTION_APP}'
+                  'FUNCTION_APP_URL={function_app_url}'
                   'FUNCTION_APP_PRINCIPAL_ID=44444444-4444-4444-8444-444444444444'
-                  'KEYVAULT_ID={rg_id}/providers/Microsoft.KeyVault/vaults/zsp-lab-kv'
+                  'KEYVAULT_ID={STUB_KEY_VAULT_ID}'
                   'KEYVAULT_NAME=zsp-lab-kv'
                   'STORAGE_ACCOUNT_ID={rg_id}/providers/Microsoft.Storage/storageAccounts/zsptest'
                   'STORAGE_ACCOUNT_NAME=zsptest'
@@ -712,13 +768,15 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
         (scripts / "Test-Lab.ps1").write_text(
-            "param($FunctionAppUrl,$FunctionKey,$FunctionAppResourceId,$ManifestPath,$BackupSpObjectId,$KeyVaultResourceId,[switch]$WaitForRevocation)\nWrite-Host 'SMOKE FAILED'\nexit 9\n",
+            "param($FunctionAppUrl,$FunctionKey,$FunctionAppResourceId,$ManifestPath,$BackupSpObjectId,$KeyVaultResourceId,[switch]$WaitForRevocation)\n"
+            + smoke_test,
             encoding="utf-8",
         )
+        return lab
 
-        smoke_manifest = lab / ".zsp-deployment.json"
-        result = self._run_pwsh(
-            scripts / "Deploy-Lab.ps1",
+    def _deploy_stubbed_lab(self, lab: Path, **extra_env: str) -> subprocess.CompletedProcess:
+        return self._run_pwsh(
+            lab / "scripts" / "Deploy-Lab.ps1",
             "-ProjectName",
             PROJECT,
             "-Location",
@@ -726,14 +784,136 @@ class ZspPowerShellRuntimeTests(unittest.TestCase):
             "-SkipFunctionDeploy",
             "-ConfirmLifecycleMigration",
             "-ManifestPath",
-            str(smoke_manifest),
+            str(lab / ".zsp-deployment.json"),
+            **extra_env,
         )
+
+    def test_smoke_failure_never_emits_or_records_validated_completion(self) -> None:
+        lab = self._write_stubbed_lab(
+            function_app_url="https://zsp-lab-gw-mock.azurewebsites.net",
+            smoke_test="Write-Host 'SMOKE FAILED'\nexit 9\n",
+        )
+        result = self._deploy_stubbed_lab(lab)
         self.assertNotEqual(result.returncode, 0)
         combined = result.stdout + result.stderr
         self.assertIn("SMOKE FAILED", combined)
         self.assertNotIn("Deployment Complete", combined)
-        manifest = json.loads(smoke_manifest.read_text(encoding="utf-8"))
+        manifest = json.loads((lab / ".zsp-deployment.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["status"], "identities_configured")
+
+    def test_closing_hint_runs_as_printed_and_never_exposes_the_function_key(self) -> None:
+        # Deploy-Lab.ps1 holds the Function key for its smoke test. Its closing
+        # hint must not print that key, and the commands it prints must work
+        # against the admission and status contract the Function implements.
+        # Low-entropy on purpose: a distinctive marker, not something a secret
+        # scanner of the mirrored lab should mistake for a credential.
+        function_key = "fixture-key-fixture-key"
+        gateway = http.server.ThreadingHTTPServer(("127.0.0.1", 0), GatewayStandIn)
+        gateway.function_key = function_key
+        gateway.status_uri = None
+        gateway.requests = []
+        self.addCleanup(gateway.server_close)
+        self.addCleanup(gateway.shutdown)
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        origin = f"http://127.0.0.1:{gateway.server_address[1]}"
+
+        lab = self._write_stubbed_lab(
+            function_app_url=origin,
+            smoke_test="Write-Host 'SMOKE PASSED'\nexit 0\n",
+        )
+        deployed = self._deploy_stubbed_lab(lab, MOCK_FUNCTION_KEY=function_key)
+        printed = ANSI_CONTROL_SEQUENCE.sub("", deployed.stdout + deployed.stderr)
+        self.assertEqual(deployed.returncode, 0, printed)
+        self.assertIn("SMOKE PASSED", printed)
+        self.assertIn("Deployment Complete and Smoke-Tested", printed)
+        manifest = json.loads((lab / ".zsp-deployment.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "validated")
+        self.assertNotIn(function_key, printed)
+        self.assertNotIn("management payload", printed)
+        self.assertIn(
+            "The POST returns HTTP 202 with id, status 'accepted' and statusQueryGetUri",
+            printed,
+        )
+        self.assertIn("Remove-Variable functionKey, headers", printed)
+
+        lines = printed.splitlines()
+        first = next(
+            index for index, line in enumerate(lines)
+            if line.startswith("$functionKey = az functionapp keys list")
+        )
+        last = next(index for index in range(first, len(lines)) if not lines[index].strip())
+        hint = self.root / "printed-hint.ps1"
+        hint.write_text("\n".join(lines[first:last]) + "\n", encoding="utf-8")
+
+        calls_before_hint = len(self._calls())
+        polled = self._run_pwsh(
+            hint,
+            MOCK_FUNCTION_KEY=function_key,
+            NO_PROXY="127.0.0.1",
+            no_proxy="127.0.0.1",
+        )
+        hint_output = ANSI_CONTROL_SEQUENCE.sub("", polled.stdout + polled.stderr)
+        self.assertEqual(polled.returncode, 0, hint_output)
+        self.assertNotIn(function_key, hint_output)
+        lifecycle = json.loads(polled.stdout)
+        self.assertEqual(lifecycle["runtimeStatus"], "Running", hint_output)
+        self.assertEqual(lifecycle["customStatus"]["status"], "active", hint_output)
+
+        # The only process the hint starts is the Azure CLI, and the key is its
+        # output, never one of its arguments.
+        self.assertEqual(
+            self._calls()[calls_before_hint:],
+            [[
+                "functionapp", "keys", "list", "--name", STUB_FUNCTION_APP,
+                "--resource-group", RESOURCE_GROUP,
+                "--query", "functionKeys.default", "--output", "tsv",
+            ]],
+        )
+        self.assertFalse(
+            any(function_key in argument for call in self._calls() for argument in call)
+        )
+
+        self.assertEqual(len(gateway.requests), 2, gateway.requests)
+        admission, poll = gateway.requests
+        self.assertEqual((admission["method"], admission["path"]), ("POST", "/api/nhi-access"))
+        self.assertEqual(admission["key"], function_key)
+        self.assertEqual(
+            admission["body"],
+            {
+                "sp_object_id": STUB_BACKUP_SP,
+                "scope": STUB_KEY_VAULT_ID,
+                "role": "Key Vault Secrets User",
+                "duration_minutes": 5,
+                "workflow_id": "manual-test",
+            },
+        )
+        self.assertEqual(
+            (poll["method"], poll["path"]),
+            ("GET", f"/api/access-status/{GatewayStandIn.instance_id}"),
+        )
+        self.assertEqual(poll["key"], function_key)
+
+        # A status URL other than this app's read-only route, such as a Durable
+        # management URL, is refused before the key is sent anywhere else.
+        gateway.status_uri = (
+            f"{origin}/runtime/webhooks/durabletask/instances/"
+            f"{GatewayStandIn.instance_id}?code=management-key"
+        )
+        gateway.requests.clear()
+        refused = self._run_pwsh(
+            hint,
+            MOCK_FUNCTION_KEY=function_key,
+            NO_PROXY="127.0.0.1",
+            no_proxy="127.0.0.1",
+        )
+        refused_output = ANSI_CONTROL_SEQUENCE.sub("", refused.stdout + refused.stderr)
+        self.assertNotEqual(refused.returncode, 0, refused_output)
+        self.assertIn("Unexpected status URL", plain_process_output(refused))
+        self.assertNotIn(function_key, refused_output)
+        self.assertEqual(
+            [(request["method"], request["path"]) for request in gateway.requests],
+            [("POST", "/api/nhi-access")],
+        )
 
 
 if __name__ == "__main__":

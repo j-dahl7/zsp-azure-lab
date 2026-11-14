@@ -8,10 +8,12 @@ A serverless gateway that grants time-bounded Azure permissions to AI agents, au
 
 ## Validation Boundary
 
-This revision is validated with offline Python unit/contract tests, real SDK
-registration and mocked transport checks, PowerShell regressions, and Bicep
-compilation. It has not been freshly deployed to an Azure/Entra tenant, and no
-live role grant, group
+Offline checks only, as of November 13, 2026. This revision is validated with
+offline Python unit/contract tests, real SDK registration and mocked transport
+checks, PowerShell regressions, and Bicep compilation. An offline test runs the
+manual-test commands that `Deploy-Lab.ps1` prints against a loopback stand-in
+for the gateway, not a deployed Function. It has not been freshly deployed to an
+Azure/Entra tenant, and no live role grant, group
 membership, Durable Functions lifecycle, audit ingestion, or cleanup was run
 for this revision. Treat the smoke test and API responses as runtime checks
 that must pass in your own tenant.
@@ -320,12 +322,29 @@ See [GitHub dependency submission](https://docs.github.com/en/rest/dependency-gr
 
 ### 3. Test NHI Access
 
-Request temporary Key Vault access for a service principal:
+When `Deploy-Lab.ps1` finishes, it prints these steps as PowerShell commands for
+the deployed app, with its names and IDs filled in. The Bash form below needs
+curl 7.55.0 or later. Set `FUNCTION_APP_NAME`, `RESOURCE_GROUP_NAME` and
+`FUNCTION_URL` from the Function App, Resource Group and Function App URL values
+that the deployment prints.
+
+Read the ordinary host Function key from Azure into a shell variable instead of
+typing or pasting it, so it is not echoed and not saved in shell history:
 
 ```bash
-curl -X POST "$FUNCTION_URL/api/nhi-access" \
+FUNCTION_KEY="$(az functionapp keys list --name "$FUNCTION_APP_NAME" \
+  --resource-group "$RESOURCE_GROUP_NAME" --query functionKeys.default --output tsv)"
+```
+
+Request temporary Key Vault access for a service principal. The key reaches curl
+on standard input (`--header @-`), not in a `-H` argument: command-line arguments
+are visible to other local processes and to command-line logging. `printf` is a
+shell builtin, so the key never becomes a process argument:
+
+```bash
+printf 'x-functions-key: %s\n' "$FUNCTION_KEY" | curl --max-redirs 0 --header @- \
+  -X POST "$FUNCTION_URL/api/nhi-access" \
   -H "Content-Type: application/json" \
-  -H "x-functions-key: $FUNCTION_KEY" \
   -d '{
     "sp_object_id": "BACKUP_SP_OBJECT_ID",
     "scope": "/subscriptions/.../providers/Microsoft.KeyVault/vaults/zsp-lab-kv-XXXXXX",
@@ -341,6 +360,7 @@ restricted lifecycle polling response. Admission does not prove access already e
 ```json
 {
   "id": "<orchestration-instance-id>",
+  "status": "accepted",
   "statusQueryGetUri": "https://<function-app>.azurewebsites.net/api/access-status/<orchestration-instance-id>"
 }
 ```
@@ -350,7 +370,7 @@ and `/api/access-status/{id}` path, with no query or fragment. Send the ordinary
 Function key in `X-Functions-Key` for every poll, and do not follow redirects:
 
 ```bash
-curl --max-redirs 0 "$STATUS_QUERY_GET_URI" -H "X-Functions-Key: $FUNCTION_KEY"
+printf 'X-Functions-Key: %s\n' "$FUNCTION_KEY" | curl --max-redirs 0 --header @- "$STATUS_QUERY_GET_URI"
 ```
 
 The key must authorize both the admission and status routes; the lab deployer

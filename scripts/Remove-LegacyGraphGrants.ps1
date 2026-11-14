@@ -1,4 +1,5 @@
 #Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Review or remove explicitly selected legacy broad Graph app-role grants.

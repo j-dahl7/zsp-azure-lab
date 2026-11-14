@@ -1,4 +1,5 @@
 #Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Grants Graph API and Azure RBAC permissions to the Function App managed identity.

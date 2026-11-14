@@ -1,4 +1,5 @@
 #Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Deploys provenance-bound Azure infrastructure using Bicep.
