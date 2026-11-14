@@ -35,11 +35,14 @@
     Duration in minutes for test access grant. Default: 2
 
 .EXAMPLE
+    $functionKey = az functionapp keys list --name "zsp-lab-gw-abc123" --resource-group "zsp-lab-rg" `
+                   --query functionKeys.default --output tsv
     ./Test-Lab.ps1 -FunctionAppUrl "https://zsp-lab-gw-abc123.azurewebsites.net" `
                    -FunctionAppResourceId "/subscriptions/.../resourceGroups/.../providers/Microsoft.Web/sites/..." `
-                   -FunctionKey "your-function-key" `
+                   -FunctionKey $functionKey `
                    -BackupSpObjectId "abc123" `
                    -KeyVaultResourceId "/subscriptions/.../Microsoft.KeyVault/vaults/..."
+    Reads the key from Azure into a variable, so it is not typed into a command or saved in shell history.
 #>
 
 [CmdletBinding()]

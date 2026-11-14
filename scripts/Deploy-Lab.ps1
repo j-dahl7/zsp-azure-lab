@@ -674,18 +674,43 @@ $safeRerunCommand = './scripts/Deploy-Lab.ps1 -ConfirmLifecycleMigration' +
     ' -ExpectedBackupSpObjectId ' + (ConvertTo-RerunLiteral $config['BACKUP_SP_OBJECT_ID'])
 Write-Host $safeRerunCommand -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "Test NHI access with:"
-Write-Host @"
-curl -X POST "$($config['FUNCTION_APP_URL'])/api/nhi-access" \
-  -H "Content-Type: application/json" \
-  -H "x-functions-key: <FUNCTION_KEY>" \
-  -d '{
-    "sp_object_id": "$($config['BACKUP_SP_OBJECT_ID'])",
-    "scope": "$($config['KEYVAULT_ID'])",
-    "role": "Key Vault Secrets User",
-    "duration_minutes": 5,
-    "workflow_id": "manual-test"
-  }'
-"@ -ForegroundColor DarkGray
-Write-Host "The POST returns a Durable Functions management payload (HTTP 202)." -ForegroundColor Yellow
-Write-Host "Poll its statusQueryGetUri until customStatus.status is 'active' before using the access." -ForegroundColor Yellow
+Write-Host "Test NHI access from PowerShell. These commands read the Function key from Azure into a variable and send it"
+Write-Host "only as a request header, so it is never typed, printed, passed on a command line, or saved in shell history."
+# The template is a single-quoted here-string, so nothing in it is expanded and the
+# key this script holds for the smoke test cannot reach the output. Each <NAME>
+# placeholder becomes a quoted PowerShell literal in one pass.
+$nhiOrigin = ([string]$config['FUNCTION_APP_URL']).TrimEnd('/').ToLowerInvariant()
+$nhiHintValues = @{
+    FUNCTION_APP_NAME   = $config['FUNCTION_APP_NAME']
+    RESOURCE_GROUP_NAME = $config['RESOURCE_GROUP_NAME']
+    BACKUP_SP_OBJECT_ID = $config['BACKUP_SP_OBJECT_ID']
+    KEYVAULT_ID         = $config['KEYVAULT_ID']
+    NHI_ACCESS_URI      = "$nhiOrigin/api/nhi-access"
+    STATUS_URI_PREFIX   = "$nhiOrigin/api/access-status/"
+}
+$nhiHintTemplate = @'
+$functionKey = az functionapp keys list --name <FUNCTION_APP_NAME> --resource-group <RESOURCE_GROUP_NAME> --query functionKeys.default --output tsv
+$headers = @{ 'x-functions-key' = $functionKey }
+$body = @{
+    sp_object_id     = <BACKUP_SP_OBJECT_ID>
+    scope            = <KEYVAULT_ID>
+    role             = 'Key Vault Secrets User'
+    duration_minutes = 5
+    workflow_id      = 'manual-test'
+} | ConvertTo-Json
+$admission = Invoke-RestMethod -Method Post -Uri <NHI_ACCESS_URI> -Headers $headers -ContentType 'application/json' -Body $body -MaximumRedirection 0
+$statusUri = <STATUS_URI_PREFIX> + $admission.id
+if ($admission.id -cnotmatch '^[A-Za-z0-9_-]{1,100}$' -or $admission.statusQueryGetUri -cne $statusUri) { throw 'Unexpected status URL in the response; stop and investigate.' }
+Invoke-RestMethod -Uri $statusUri -Headers $headers -MaximumRedirection 0 | ConvertTo-Json -Depth 5
+'@
+$nhiHint = [regex]::Replace($nhiHintTemplate, '<([A-Z_]+)>', {
+    param($placeholder)
+    ConvertTo-RerunLiteral ([string]$nhiHintValues[$placeholder.Groups[1].Value])
+})
+Write-Host $nhiHint -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "The POST returns HTTP 202 with id, status 'accepted' and statusQueryGetUri: a status URL on this Function app that contains no key." -ForegroundColor Yellow
+Write-Host "Admission is not access yet. Repeat the last command, which sends the same x-functions-key header, until customStatus.status is 'active' before using the access." -ForegroundColor Yellow
+Write-Host "Stop if runtimeStatus becomes Failed, Terminated or Canceled: the request did not establish usable access." -ForegroundColor Yellow
+Write-Host "When you finish, run 'Remove-Variable functionKey, headers' so the key does not stay in the session." -ForegroundColor Yellow
+Write-Host "README section 'Test NHI Access' has the curl form, the other status values, and the revocation guidance." -ForegroundColor Yellow
