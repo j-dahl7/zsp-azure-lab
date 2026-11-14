@@ -1,4 +1,5 @@
 #Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Creates Entra ID objects for Zero Standing Privilege lab.
