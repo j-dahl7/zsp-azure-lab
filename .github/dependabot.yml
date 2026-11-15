@@ -10,7 +10,13 @@ updates:
     directory: "/function"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    # Version updates are off for this folder. requirements.txt is a
+    # hash-locked entry file over pins.txt, refreshed by hand with uv, and
+    # Dependabot regenerates it as the unhashed output of requirements.in,
+    # so its pull requests fail the hash-enforced install. A limit of 0
+    # stops version-update pull requests only: security update pull
+    # requests have their own fixed limit, and alerts are unaffected.
+    open-pull-requests-limit: 0
     labels:
       - "dependencies"
     ignore:

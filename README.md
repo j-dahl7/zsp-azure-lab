@@ -8,7 +8,7 @@ A serverless gateway that grants time-bounded Azure permissions to AI agents, au
 
 ## Validation Boundary
 
-Offline checks only, as of November 13, 2026. This revision is validated with
+Offline checks only, as of November 14, 2026. This revision is validated with
 offline Python unit/contract tests, real SDK registration and mocked transport
 checks, PowerShell regressions, and Bicep compilation. An offline test runs the
 manual-test commands that `Deploy-Lab.ps1` prints against a loopback stand-in
@@ -688,10 +688,15 @@ Remove the manifest-recorded Entra groups, application, and service principal:
 ```
 
 For full lab cleanup, also request deletion of the exact manifest-recorded
-Azure resource group:
+Azure resource group. Preview it first:
 
 ```powershell
 ./scripts/Cleanup-Lab.ps1 -ConfirmProject "zsp-lab" -DestroyAzureResources -WhatIf
+```
+
+After reviewing the preview, run the full cleanup:
+
+```powershell
 ./scripts/Cleanup-Lab.ps1 -ConfirmProject "zsp-lab" -DestroyAzureResources
 ```
 
